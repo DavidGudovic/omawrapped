@@ -1,0 +1,22 @@
+# Nothing generated belongs in the plugin folder: the shell reloads every
+# plugin whenever a file under one changes.
+__pycache__/
+*.pyc
+*.qmlc
+*.jsc
+.qmlls.ini
+node_modules/
+
+# Recorded activity and rendered cards live outside the repository. Listed
+# in case a copy ever lands here.
+days/
+omawrapped-*.png
+*.part
+
+# Local notes and editor or agent state
+REPORT.md
+.claude/
+CLAUDE.md
+.idea/
+.vscode/
+*.swp

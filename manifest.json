@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.davidgudovic.omawrapped",
+  "name": "OmaWrapped",
+  "version": "0.1.0",
+  "author": "David Gudovic",
+  "license": "MIT",
+  "description": "Your week on Omarchy as a shareable card: screen time, top apps, busiest day and hour, and git commits. Counted by the shell itself and kept on your machine.",
+  "repository": "https://github.com/DavidGudovic/omawrapped",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": { "service": "Service.qml", "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "OmaWrapped",
+    "description": "Today's screen time in the bar; click for your recap card",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "display": "time",
+      "idleSeconds": 120,
+      "ignoreApps": "",
+      "repoDirs": "~/projects, ~/code"
+    },
+    "schema": [
+      {
+        "key": "display",
+        "type": "enum",
+        "label": "Show in the bar",
+        "options": ["time", "icon"],
+        "defaultValue": "time",
+        "description": "'time' shows today's screen time beside the icon; 'icon' shows the icon alone."
+      },
+      {
+        "key": "idleSeconds",
+        "type": "integer",
+        "label": "Away after (seconds without input)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 120,
+        "description": "Time stops counting once you have not touched the keyboard or mouse for this long. A playing video keeps it counting."
+      },
+      {
+        "key": "ignoreApps",
+        "type": "string",
+        "label": "Apps never recorded",
+        "defaultValue": "",
+        "description": "Comma-separated window classes (as `hyprctl clients` shows them). Time in these apps is not counted at all."
+      },
+      {
+        "key": "repoDirs",
+        "type": "string",
+        "label": "Folders with your git repositories",
+        "defaultValue": "~/projects, ~/code",
+        "description": "Comma-separated. Commits you authored in repositories under these folders are counted on the card."
+      }
+    ]
+  }
+}
