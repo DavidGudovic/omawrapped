@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.davidgudovic.omawrapped",
   "name": "OmaWrapped",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "David Gudovic",
   "license": "MIT",
   "description": "Your week on Omarchy as a shareable card: screen time, top apps, busiest day and hour, and git commits. Counted by the shell itself and kept on your machine.",

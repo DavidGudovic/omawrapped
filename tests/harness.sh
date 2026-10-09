@@ -23,13 +23,26 @@ cp -- "$REPO/tests/harness/$CASE.qml" "$RUN/root/shell.qml"
 ln -s -- "$SHELL_DIR/Ui" "$RUN/root/Ui"
 ln -s -- "$SHELL_DIR/Commons" "$RUN/root/Commons"
 
-# A stand-in for Omarchy's notifier, so a case can read what would have been
-# shown instead of showing it. It appends, so a second call is seen too.
+# Stand-ins for every desktop program the plugin can start, first in PATH,
+# so a case can read what would have happened instead of it happening.
+#
+# The notifier appends its arguments, one per line, and "==" after each call.
 cat > "$RUN/bin/omarchy-notification-send" <<'STUB'
 #!/usr/bin/sh
-printf '%s\n' "$@" >> "$OW_RUN/notification.txt"
+{ printf '%s\n' "$@"; echo "=="; } >> "$OW_RUN/notification.txt"
 STUB
-chmod +x "$RUN/bin/omarchy-notification-send"
+# Omarchy's menu: answers with the line in menu-choice, or is dismissed.
+cat > "$RUN/bin/omarchy-menu-select" <<'STUB'
+#!/usr/bin/sh
+printf '%s\n' "$@" > "$OW_RUN/menu-asked.txt"
+[ -s "$OW_RUN/menu-choice" ] || exit 1
+cat "$OW_RUN/menu-choice"
+STUB
+# The rest only write down that they were started, and with what.
+for name in nautilus uwsm-app xdg-open wl-copy notify-send; do
+  printf '#!/usr/bin/sh\necho "%s $*" >> "$OW_RUN/started.txt"\n' "$name" > "$RUN/bin/$name"
+done
+chmod +x "$RUN"/bin/*
 
 env -i HOME="$RUN/home" XDG_RUNTIME_DIR="$RUN" XDG_DATA_HOME="$RUN/data" \
   XDG_CONFIG_HOME="$RUN/config" XDG_CACHE_HOME="$RUN/cache" XDG_STATE_HOME="$RUN/state" \

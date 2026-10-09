@@ -10,7 +10,7 @@ ShellRoot {
 
   readonly property string repo: Quickshell.env("OW_REPO")
   readonly property string pluginId: "io.github.davidgudovic.omawrapped"
-  readonly property string glyph: ""
+  readonly property string glyph: "\udb85\udd4d"
 
   property var widget: null
   property var failures: []
@@ -78,7 +78,9 @@ ShellRoot {
     [100, function() {
       equal("today", widget.today, "2h 05m")
       equal("time shown", widget.showTime, true)
-      equal("tooltip", widget.tooltip, "2h 05m of screen time today · click: card of the last 7 days · right click: last 30 days")
+      equal("tooltip", widget.tooltip,
+        "2h 05m of screen time today · click: week card · right: month card · middle: copy or show it")
+      equal("the icon is the chart box", widget.glyph, glyph)
       truthy("has a width", widget.implicitWidth > 40)
       equal("as tall as the bar", widget.implicitHeight, 26)
       harness.wideWidth = widget.implicitWidth
@@ -103,18 +105,94 @@ ShellRoot {
     }],
     [4000, function() {
       equal("not busy once the command is done", widget.busy, false)
-      // tests/harness.sh puts a stand-in omarchy-notification-send first in
-      // PATH; it writes its arguments, one per line, to this file.
-      var view = fileComponent.createObject(harness, { path: Quickshell.env("OW_RUN") + "/notification.txt" })
-      var sent = view.text().split("\n")
-      view.destroy()
-      equal("failure is notified once, under the app's name", sent.slice(0, 5).join("|"),
-        "--app-name|OmaWrapped|-g|" + glyph + "|OmaWrapped could not make the card")
-      truthy("the notification says why: " + sent[5], /^Nothing was recorded for the last 7 days \(.+\)\.$/.test(sent[5] || ""))
-      equal("nothing after the reason", sent.slice(6).join(""), "")
+      var sent = notifications()
+      equal("the failure is notified once", sent.length, 1)
+      equal("under the app's name, with its icon", (sent[0] || []).slice(0, 5).join("|"),
+        "--app-name|OmaWrapped|-g|" + glyph + "|OmaWrapped")
+      truthy("and says why: " + (sent[0] || [])[5],
+        /^Nothing was recorded for the last 7 days \(.+\)\.$/.test((sent[0] || [])[5] || ""))
+      equal("nothing after the reason", (sent[0] || []).length, 6)
+      // Middle click: Omarchy's menu, here dismissed without a choice.
+      widget.handlePress(Qt.MiddleButton)
+      equal("the menu does not dim the widget", widget.busy, false)
+    }],
+    [2500, function() {
+      equal("the menu was asked for under the plugin's name", lines("menu-asked.txt")[0], "OmaWrapped")
+      equal("it offers copying the card", lines("menu-asked.txt").join("|").indexOf("\tCopy card") !== -1, true)
+      equal("and showing it in its folder", lines("menu-asked.txt").join("|").indexOf("\tShow in folder") !== -1, true)
+      equal("a dismissed menu is not an error", notifications().length, 1)
+      // Now something is chosen, but there is no card to copy yet.
+      choice.setText("Copy card\n")
+      widget.handlePress(Qt.MiddleButton)
+    }],
+    [2500, function() {
+      var sent = notifications()
+      equal("a choice that fails is reported", sent.length, 2)
+      truthy("with the reason: " + (sent[1] || [])[5], /^There is no card yet\./.test((sent[1] || [])[5] || ""))
+      equal("no desktop program was started", lines("started.txt").join(""), "")
+      // From here on there is something to draw: a month of sample days.
+      sample.running = true
+    }],
+    [1500, function() { widget.handlePress(Qt.LeftButton) }],
+    [5000, function() {
+      equal("the card is done", widget.busy, false)
+      var sent = notifications()
+      var said = sent[2] || []
+      var card = said[said.length - 1] || ""
+      equal("a drawn card is announced", sent.length, 3)
+      equal("as copied, with the card as its picture", said.slice(4, 7).join("|"), "--image|" + card + "|Card copied")
+      truthy("the card is in the Pictures folder: " + card, /\/home\/Pictures\/omawrapped-\d{4}-\d\d-\d\d\.png$/.test(card))
+      equal("a click on the notification shows it in its folder", said.slice(-4).join("|"),
+        "--exec|" + repo + "/bin/omawrapped|show|" + card)
+      var started = lines("started.txt")
+      equal("the picture went to the clipboard", started.indexOf("wl-copy --type image/png") !== -1, true)
+      equal("and the card was opened", started.indexOf("xdg-open " + card) !== -1, true)
+      harness.card = card
+      choice.setText("Show in folder\n")
+      widget.handlePress(Qt.MiddleButton)
+    }],
+    [2500, function() {
+      equal("the menu shows the card in its folder",
+        lines("started.txt").indexOf("uwsm-app -- nautilus --select " + harness.card) !== -1, true)
+      equal("without another notification", notifications().length, 3)
       widget.destroy()
     }]
   ]
+
+  property string card: ""
+
+  // tests/make_sample.py, writing into this run's data folder.
+  Process {
+    id: sample
+    command: ["/usr/bin/python3", "-B", harness.repo + "/tests/make_sample.py", Quickshell.env("OW_RUN")]
+  }
+
+  // The lines of a file the stand-ins in tests/harness.sh write.
+  function lines(name) {
+    var view = fileComponent.createObject(harness, { path: Quickshell.env("OW_RUN") + "/" + name })
+    var text = view.text()
+    view.destroy()
+    return text === "" ? [] : text.replace(/\n$/, "").split("\n")
+  }
+
+  // Every notification sent so far, each as its list of arguments.
+  function notifications() {
+    var calls = []
+    var call = []
+    var all = lines("notification.txt")
+    for (var i = 0; i < all.length; i++) {
+      if (all[i] === "==") { calls.push(call); call = [] }
+      else call.push(all[i])
+    }
+    return calls
+  }
+
+  FileView {
+    id: choice
+    path: Quickshell.env("OW_RUN") + "/menu-choice"
+    blockWrites: true
+    printErrors: false
+  }
 
   Component {
     id: fileComponent

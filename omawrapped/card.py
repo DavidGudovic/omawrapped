@@ -197,8 +197,18 @@ def _columns(c: Canvas, values, x0, x1, top, base, peak, bar_width):
     return centres
 
 
+def _mark(c: Canvas, x, y, size):
+    """The plugin's icon, as in the bar: a card with a chart in it. Drawn, so that it needs no icon font."""
+    unit = size / 18
+    c.parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="%.1f" fill="%s"/>' % (
+        x, y, size, size, 2 * unit, c.colors.mark))
+    # Three bars standing on one line, cut out of the card.
+    for left, height in ((4, 7), (8, 10), (12, 4)):
+        c.rect(x + left * unit, y + (14 - height) * unit, 2 * unit, height * unit, c.colors.background)
+
+
 def _header(c: Canvas, summary: Summary):
-    c.rect(MARGIN, 82, 26, 26, c.colors.mark)
+    _mark(c, MARGIN, 82, 26)
     c.text(MARGIN + 44, 108, "OMAWRAPPED", 34, c.colors.ink, bold=True, spacing=6)
     c.text(WIDTH - MARGIN, 106, "%s · %s" % (summary.period.label, summary.period.span), 26, c.colors.secondary, anchor="end")
 

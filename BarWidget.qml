@@ -8,8 +8,14 @@ import "Tracker.js" as Tracker
 //
 // A copy exists per monitor and is rebuilt with the bar, so it keeps
 // nothing. The counting happens in Service.qml; this only shows its total
-// and runs `omawrapped card` when asked: left click for the week, right
-// click for the month.
+// and runs the `omawrapped` command when asked:
+//
+//   left click    the card of the last 7 days
+//   right click   the card of the last 30 days
+//   middle click  Omarchy's menu, to copy the last card or show its folder
+//
+// A card is opened, put on the clipboard as a picture and announced by the
+// command itself. Only what goes wrong is reported from here.
 BarWidget {
   id: root
   moduleName: "io.github.davidgudovic.omawrapped"
@@ -20,54 +26,64 @@ BarWidget {
   readonly property bool live: service !== null && service.ready === true
 
   readonly property bool showTime: setting("display", "time") !== "icon" && !vertical
-  readonly property string glyph: "\uf06b"
+  // Material Design "chart box", from the same icon set as the bar's own
+  // icons: a card with a chart in it. U+F154D, written as its two halves.
+  readonly property string glyph: "󱕍"
   readonly property string today: live ? Tracker.formatDuration(service.todayMs) : ""
   readonly property string command: decodeURIComponent(String(Qt.resolvedUrl("bin/omawrapped")).replace(/^file:\/\//, ""))
-  // True from the click until the command is over. Process.running turns
-  // true only once the command has started, which is too late to stop a
-  // second click.
-  property bool busy: false
+  readonly property bool busy: card.pending
 
   readonly property string tooltip: {
     if (busy) return "Drawing your card…"
     if (!live) return "OmaWrapped is starting…"
-    return today + " of screen time today · click: card of the last 7 days · right click: last 30 days"
+    return today + " of screen time today · click: week card · right: month card · middle: copy or show it"
   }
 
-  function makeCard(period) {
-    if (busy) return
-    busy = true
-    card.command = [root.command, "card", period, "--open"]
-    card.running = true
-  }
-
-  // The card opens in the image viewer when it is done, so only a failure
-  // is worth a notification.
-  function finish(error) {
-    busy = false
-    if (error) Quickshell.execDetached(["omarchy-notification-send", "--app-name", "OmaWrapped", "-g", root.glyph,
-      "OmaWrapped could not make the card", error])
+  function report(problem) {
+    Quickshell.execDetached(["omarchy-notification-send", "--app-name", "OmaWrapped", "-g", root.glyph,
+      "OmaWrapped", problem])
   }
 
   function handlePress(button) {
-    if (button === Qt.LeftButton) makeCard("--week")
-    else if (button === Qt.RightButton) makeCard("--month")
+    if (button === Qt.LeftButton) card.start(["card", "--week", "--open", "--copy", "image", "--notify"])
+    else if (button === Qt.RightButton) card.start(["card", "--month", "--open", "--copy", "image", "--notify"])
+    else if (button === Qt.MiddleButton) menu.start(["menu"])
   }
 
   implicitWidth: showTime ? label.implicitWidth : icon.implicitWidth
   implicitHeight: showTime ? label.implicitHeight : icon.implicitHeight
 
-  Process {
-    id: card
-    stderr: StdioCollector { id: cardErrors; waitForEnd: true }
+  // One run of the command. `pending` is true from the click until the
+  // command is over: Process.running turns true only once it has started,
+  // which is too late to stop a second click.
+  component Command: Process {
+    property bool pending: false
+
+    function start(args) {
+      if (pending) return
+      pending = true
+      command = [root.command].concat(args)
+      running = true
+    }
+
+    stderr: StdioCollector { id: errors; waitForEnd: true }
     // The first line the command printed says why it failed.
     onExited: function(exitCode) {
-      var said = String(cardErrors.text || "").trim().split("\n")[0]
-      root.finish(exitCode === 0 ? "" : (said || "Run `omawrapped card` in a terminal to see why."))
+      pending = false
+      var said = String(errors.text || "").trim().split("\n")[0]
+      if (exitCode !== 0) root.report(said || "Run `omawrapped` in a terminal to see why.")
     }
     // A command that cannot be started never exits; it only stops running.
-    onRunningChanged: if (!running && root.busy) root.finish("The omawrapped command could not be started.")
+    onRunningChanged: if (!running && pending) {
+      pending = false
+      root.report("The omawrapped command could not be started.")
+    }
   }
+
+  Command { id: card }
+  // The menu stays open until something is picked, so it runs on its own
+  // and does not dim the widget.
+  Command { id: menu }
 
   WidgetButton {
     id: label
