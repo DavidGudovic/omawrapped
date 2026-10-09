@@ -168,7 +168,8 @@ class Canvas:
     def svg(self) -> str:
         family = "'%s', monospace" % self.metrics.family if self.metrics.family != "monospace" else "monospace"
         return (
-            '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" font-family="%s">\n%s\n</svg>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" font-family="%s">'
+            "\n%s\n</svg>\n"
             % (WIDTH, HEIGHT, WIDTH, HEIGHT, family, "\n".join(self.parts))
         )
 
@@ -210,7 +211,8 @@ def _mark(c: Canvas, x, y, size):
 def _header(c: Canvas, summary: Summary):
     _mark(c, MARGIN, 82, 26)
     c.text(MARGIN + 44, 108, "OMAWRAPPED", 34, c.colors.ink, bold=True, spacing=6)
-    c.text(WIDTH - MARGIN, 106, "%s · %s" % (summary.period.label, summary.period.span), 26, c.colors.secondary, anchor="end")
+    c.text(WIDTH - MARGIN, 106, "%s · %s" % (summary.period.label, summary.period.span), 26, c.colors.secondary,
+           anchor="end")
 
 
 def _hero(c: Canvas, summary: Summary):

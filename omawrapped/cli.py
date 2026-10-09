@@ -297,7 +297,8 @@ def cmd_stats(args) -> int:
         ("Screen time", "%s (avg %s per active day, %d of %d days)" % (
             aggregate.duration(summary.total_ms), aggregate.duration(summary.average_ms),
             summary.active_days, period.length)),
-        ("Busiest day", "%s · %s" % (busiest[0].strftime("%a %b ") + str(busiest[0].day), aggregate.duration(busiest[1]))),
+        ("Busiest day", "%s · %s" % (
+            busiest[0].strftime("%a %b ") + str(busiest[0].day), aggregate.duration(busiest[1]))),
         ("Busiest hour", aggregate.hour_label(summary.peak_hour) if summary.peak_hour is not None else "unknown"),
         ("App switches", format(summary.switches, ",")),
         ("Commits", "%s in %d of %d repos%s" % (
@@ -313,7 +314,8 @@ def cmd_stats(args) -> int:
     print("\nBy day")
     most = busiest[1]
     for day, ms in summary.daily_ms:
-        print("  %s %2d  %9s  %s" % (day.strftime("%a %b"), day.day, aggregate.duration(ms), "█" * round(24 * ms / most)))
+        print("  %s %2d  %9s  %s" % (
+            day.strftime("%a %b"), day.day, aggregate.duration(ms), "█" * round(24 * ms / most)))
     return 0
 
 
@@ -445,7 +447,8 @@ def parser() -> argparse.ArgumentParser:
                       help="what goes to the clipboard: the file's path (default), the image itself, or nothing")
     make.add_argument("--open", action="store_true", help="open the card when it is done")
     make.add_argument("--notify", action="store_true", help="say on the desktop that the card is ready")
-    make.add_argument("--theme", metavar="DIR", help="take the colours from this theme folder instead of the active theme")
+    make.add_argument("--theme", metavar="DIR",
+                      help="take the colours from this theme folder instead of the active theme")
     make.set_defaults(run=cmd_card)
 
     copy = commands.add_parser("copy", help="copy the last card's image to the clipboard",
