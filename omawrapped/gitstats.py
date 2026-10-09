@@ -47,6 +47,8 @@ def find_repos(dirs) -> list:
 
     A repository is not searched for more repositories, and hidden folders
     are skipped, which keeps the walk away from node_modules and the like.
+    Linked folders are followed, and each real folder is visited once, so a
+    link that leads back up cannot make the walk go round.
     """
     repos, seen = [], set()
     stack = [(Path(os.path.expanduser(str(d))), 0) for d in dirs]
@@ -63,7 +65,7 @@ def find_repos(dirs) -> list:
             if depth >= MAX_DEPTH:
                 continue
             with os.scandir(real) as entries:
-                children = [e.path for e in entries if not e.name.startswith(".") and e.is_dir(follow_symlinks=False)]
+                children = [e.path for e in entries if not e.name.startswith(".") and e.is_dir()]
         except OSError:
             continue
         stack.extend((Path(child), depth + 1) for child in sorted(children, reverse=True))

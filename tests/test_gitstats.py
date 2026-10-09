@@ -91,6 +91,28 @@ class FindReposTests(IsolatedCase):
         self.assertEqual(find_repos([self.root, self.root]), [found])
         self.assertEqual(find_repos([self.root, self.root / "sub" / ".." / "sub"]), [found])
 
+    def test_a_linked_folder_is_followed(self):
+        # Projects kept on another disk are often linked into the projects folder.
+        elsewhere = fake_repo(self.tmp / "elsewhere" / "repo")
+        self.root.mkdir(parents=True)
+        (self.root / "linked").symlink_to(elsewhere.parent)
+        self.assertEqual(find_repos([self.root]), [elsewhere])
+
+    def test_a_repository_reached_by_two_roads_is_listed_once(self):
+        real = fake_repo(self.root / "repo")
+        (self.root / "again").symlink_to(real)
+        self.assertEqual(find_repos([self.root]), [real])
+
+    def test_a_link_that_leads_back_up_does_not_make_the_walk_go_round(self):
+        found = fake_repo(self.root / "group" / "repo")
+        (self.root / "group" / "up").symlink_to(self.root)
+        self.assertEqual(find_repos([self.root]), [found])
+
+    def test_a_dangling_link_is_skipped(self):
+        found = fake_repo(self.root / "repo")
+        (self.root / "gone").symlink_to(self.tmp / "nowhere")
+        self.assertEqual(find_repos([self.root]), [found])
+
     def test_gives_up_on_a_tree_with_too_many_folders(self):
         for name in "abcdefghij":
             fake_repo(self.root / name)
