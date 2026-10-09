@@ -1,4 +1,4 @@
-"""The omawrapped command: card, stats, status, reset."""
+"""The omawrapped command: card, copy, show, menu, stats, status, reset."""
 
 import argparse
 import json
@@ -10,7 +10,10 @@ import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
-from . import PLUGIN_ID, VERSION, aggregate, card, gitstats, render, store, system
+from . import PLUGIN_ID, VERSION, aggregate, card, gitstats, render, share, store, system
+
+# What a click on a notification runs to show a card: this very command, by its absolute path.
+LAUNCHER = Path(__file__).resolve().parent.parent / "bin" / "omawrapped"
 
 
 def _say(message: str) -> None:
@@ -50,31 +53,28 @@ def _sampler():
     return status, status.get("dataDir") == str(store.data_dir())
 
 
-def _period(args) -> aggregate.Period:
-    return aggregate.last_days(args.days, date.today())
-
-
-def _repo_dirs(args) -> list:
-    if getattr(args, "repos", None):
-        return [d for value in args.repos for d in system.split_list(value)]
+def _repo_dirs(repos) -> list:
+    """The folders to look for git repositories in: the ones asked for, else the widget's setting, else the defaults."""
+    if repos:
+        return [d for value in repos for d in system.split_list(value)]
     return system.split_list(system.settings().get("repoDirs")) or list(gitstats.DEFAULT_DIRS)
 
 
-def _collect(args):
-    """(summary, git stats) for the period the arguments name."""
+def _collect(days: int, exclude, repos):
+    """(summary, git stats) for the last `days` days."""
     # The sampler holds up to a minute in memory; ask it to write that first.
     if _sampler()[1]:
         _shell("flush")
-    period = _period(args)
+    period = aggregate.last_days(days, date.today())
     names = system.AppNames()
     # An app the user has told the sampler to ignore stays off the card for
     # the days recorded before that, too.
-    hidden = list(args.exclude or ()) + system.split_list(system.settings().get("ignoreApps"))
+    hidden = list(exclude or ()) + system.split_list(system.settings().get("ignoreApps"))
     summary = aggregate.summarize(store.load_days(period.start, period.end), period, names.name,
                                   [system.app_key(app) for app in hidden])
     start = datetime.combine(period.start, time.min).astimezone()
     end = datetime.combine(period.end + timedelta(days=1), time.min).astimezone()
-    return summary, gitstats.count_commits(_repo_dirs(args), start, end)
+    return summary, gitstats.count_commits(_repo_dirs(repos), start, end)
 
 
 # A card needs at least a minute to say anything: times are shown in minutes.
@@ -101,54 +101,51 @@ def _default_output(period: aggregate.Period) -> Path:
     return system.pictures_dir() / ("omawrapped-%s%s.png" % (period.end.isoformat(), suffix))
 
 
-def _copy(path: Path, what: str) -> bool:
-    if not shutil.which("wl-copy"):
-        _say("wl-copy was not found, so nothing was copied.")
-        return False
-    # wl-copy stays behind to serve the clipboard. It must not inherit a
-    # pipe of ours, or reading that pipe would wait for it forever.
-    quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+def _copy(path: Path, what: str):
+    """Puts the card on the clipboard as `what` asks. What went there ("path" or "image"), else None."""
+    if what == "none":
+        return None
     try:
-        if what == "image":
-            kind = "image/svg+xml" if path.suffix.lower() == ".svg" else "image/png"
-            with open(path, "rb") as image:
-                done = subprocess.run(["wl-copy", "--type", kind], stdin=image, timeout=10, **quiet)
-        else:
-            done = subprocess.run(["wl-copy", "--", str(path)], stdin=subprocess.DEVNULL, timeout=10, **quiet)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return done.returncode == 0
+        (share.copy_image if what == "image" else share.copy_path)(path)
+    except share.ShareError as error:
+        _say(str(error))
+        return None
+    return what
 
 
-def _open(path: Path) -> None:
-    if not shutil.which("xdg-open"):
-        _say("xdg-open was not found, so the card was not opened.")
-        return
-    subprocess.Popen(
-        ["xdg-open", str(path)], start_new_session=True,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+def _announce(path: Path, copied) -> None:
+    """Says on the desktop that the card is ready; a click shows it in its folder."""
+    if copied == "image":
+        headline, body = "Card copied", "Paste it into a post."
+    elif copied == "path":
+        headline, body = "Card saved", "Its path is on the clipboard."
+    else:
+        headline, body = "Card saved", "%s." % path
+    share.notify(headline, "%s Click here to show it in its folder." % body,
+                 image=path if path.suffix.lower() == ".png" else None, click=[str(LAUNCHER), "show", str(path)])
 
 
-def cmd_card(args) -> int:
-    summary, git = _collect(args)
+def _draw_card(days: int, output=None, copy="path", open_it=False, notify=False, exclude=None, repos=None,
+               theme=None) -> int:
+    """Draws the card of the last `days` days, saves it, and does what was asked with it. The exit status."""
+    summary, git = _collect(days, exclude, repos)
     if summary.total_ms < ENOUGH_MS:
         _say(_too_little(summary))
         return 1
-    if args.theme and not (Path(args.theme).expanduser() / "colors.toml").is_file():
-        _say("%s is not a theme folder: it has no colors.toml." % args.theme)
+    if theme and not (Path(theme).expanduser() / "colors.toml").is_file():
+        _say("%s is not a theme folder: it has no colors.toml." % theme)
         return 1
-    theme = system.theme(Path(args.theme).expanduser() if args.theme else None)
+    colors = system.theme(Path(theme).expanduser() if theme else None)
     facts = card.Facts(
-        theme_name=theme.name,
+        theme_name=colors.name,
         plugins=system.plugin_count(),
         omarchy=system.omarchy_version(),
         # A card is for showing off: no commits, no commit tile.
         commits=git.commits or None,
         repos=git.repos,
     )
-    svg = card.build(summary, facts, theme, render.Metrics(system.monospace_family()))
-    output = Path(args.output).expanduser() if args.output else _default_output(summary.period)
+    svg = card.build(summary, facts, colors, render.Metrics(system.monospace_family()))
+    output = Path(output).expanduser() if output else _default_output(summary.period)
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.suffix.lower() == ".svg":
@@ -159,12 +156,107 @@ def cmd_card(args) -> int:
         _say(str(error))
         return 1
     output = output.resolve()
-    copied = args.copy != "none" and _copy(output, args.copy)
-    _say("Saved %s%s" % (output, {"path": " (path copied)", "image": " (image copied)"}[args.copy] if copied else ""))
+    # From here on the card is saved: a copy or an open that fails is reported, but is not a failure.
+    copied = _copy(output, copy)
+    _say("Saved %s%s" % (output, " (%s copied)" % copied if copied else ""))
     print(output)
-    if args.open:
-        _open(output)
+    if open_it:
+        try:
+            share.open_file(output)
+        except share.ShareError as error:
+            _say(str(error))
+    if notify:
+        _announce(output, copied)
     return 0
+
+
+def cmd_card(args) -> int:
+    return _draw_card(args.days, args.output, args.copy, args.open, args.notify, args.exclude, args.repos, args.theme)
+
+
+# ---- copy, show, menu ----
+
+def _find_card(file):
+    """The card a command works on: FILE, else the newest in Pictures. None, with the reason on stderr, without one."""
+    if file:
+        path = Path(file).expanduser()
+        if not path.exists():
+            _say("%s does not exist." % path)
+            return None
+        if not path.is_file():
+            _say("%s is not a file." % path)
+            return None
+        return path.resolve()
+    path = share.latest_card()
+    if path is None:
+        _say("There is no card yet. Draw one with `omawrapped card`, or click the widget.")
+        return None
+    return path.resolve()
+
+
+def _copy_card(file, notify: bool) -> int:
+    """Puts a card's image on the clipboard. The exit status."""
+    path = _find_card(file)
+    if path is None:
+        return 1
+    try:
+        share.copy_image(path)
+    except share.ShareError as error:
+        _say(str(error))
+        return 1
+    _say("Copied %s (image)" % path)
+    print(path)
+    if notify:
+        share.notify("Card copied", "%s is on the clipboard. Paste it anywhere." % path.name, image=path)
+    return 0
+
+
+def _show_card(file) -> int:
+    """Shows a card in the file manager. The exit status."""
+    path = _find_card(file)
+    if path is None:
+        return 1
+    try:
+        share.show_in_folder(path)
+    except share.ShareError as error:
+        _say(str(error))
+        return 1
+    print(path)
+    return 0
+
+
+def cmd_copy(args) -> int:
+    return _copy_card(args.file, args.notify)
+
+
+def cmd_show(args) -> int:
+    return _show_card(args.file)
+
+
+# The menu: (glyph, label, what choosing it does). Each does what the command of the same name does.
+MENU = (
+    ("\U000f018f", "Copy card", lambda: _copy_card(None, True)),
+    ("\U000f0770", "Show in folder", lambda: _show_card(None)),
+    ("\U000f0a33", "Card of the last 7 days",
+     lambda: _draw_card(aggregate.PERIODS["week"], copy="image", open_it=True, notify=True)),
+    ("\U000f0e17", "Card of the last 30 days",
+     lambda: _draw_card(aggregate.PERIODS["month"], copy="image", open_it=True, notify=True)),
+)
+
+
+def cmd_menu(args) -> int:
+    try:
+        label = share.choose("OmaWrapped", ["%s\t%s" % (glyph, name) for glyph, name, _ in MENU])
+    except share.ShareError as error:
+        _say(str(error))
+        return 1
+    if label is None:
+        return 0
+    for _, name, action in MENU:
+        if name == label:
+            return action()
+    _say("The menu answered %r, which is not one of its options." % label)
+    return 1
 
 
 # ---- stats ----
@@ -191,7 +283,7 @@ def _stats_json(summary, git) -> dict:
 
 
 def cmd_stats(args) -> int:
-    summary, git = _collect(args)
+    summary, git = _collect(args.days, args.exclude, args.repos)
     if args.json:
         print(json.dumps(_stats_json(summary, git), indent=2))
         return 0
@@ -211,7 +303,7 @@ def cmd_stats(args) -> int:
         ("Commits", "%s in %d of %d repos%s" % (
             format(git.commits, ","), git.repos, git.scanned,
             " (at least: not every repository could be read)" if git.incomplete else "")
-            if git.scanned else "no repositories found in " + ", ".join(_repo_dirs(args))),
+            if git.scanned else "no repositories found in " + ", ".join(_repo_dirs(args.repos))),
     ]
     for label, value in rows:
         print("%-13s %s" % (label, value))
@@ -263,7 +355,19 @@ def cmd_status(args) -> int:
         "found" if render.have_renderer() else "MISSING (package librsvg)",
         "Pango" if metrics.exact else "an estimate (python-gobject not available)", metrics.family))
     print("Clipboard wl-copy %s" % ("found" if shutil.which("wl-copy") else "MISSING (package wl-clipboard)"))
-    dirs = _repo_dirs(args)
+    notifier = next((tool for tool in ("omarchy-notification-send", "notify-send") if shutil.which(tool)), None)
+    print("Notify    %s" % (notifier + " found" if notifier
+                             else "MISSING (no notifications; results are still printed)"))
+    print("Menu      %s" % ("omarchy-menu-select found" if shutil.which("omarchy-menu-select")
+                           else "MISSING (the widget's middle-click menu needs Omarchy's menu)"))
+    if shutil.which("nautilus"):
+        files = "nautilus found"
+    elif shutil.which("xdg-open"):
+        files = "xdg-open only (opens the folder without selecting the card)"
+    else:
+        files = "MISSING"
+    print("Files     %s" % files)
+    dirs = _repo_dirs(None)
     repos = len(gitstats.find_repos(dirs))
     print("Git       %s; %d repositor%s under %s" % (
         "found" if shutil.which("git") else "MISSING (package git)",
@@ -331,7 +435,8 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", metavar="<command>")
 
     make = commands.add_parser("card", help="render the recap card as a PNG",
-                               description="Render the recap card, save it to your Pictures folder and copy its path.")
+                               description="Render the recap card and save it to your Pictures folder. "
+                                           "Its path is copied to the clipboard, unless --copy says otherwise.")
     _add_period(make)
     make.add_argument("-o", "--output", metavar="FILE",
                       help="where to save it (.png, or .svg for the drawing itself; "
@@ -339,8 +444,28 @@ def parser() -> argparse.ArgumentParser:
     make.add_argument("--copy", choices=("path", "image", "none"), default="path",
                       help="what goes to the clipboard: the file's path (default), the image itself, or nothing")
     make.add_argument("--open", action="store_true", help="open the card when it is done")
+    make.add_argument("--notify", action="store_true", help="say on the desktop that the card is ready")
     make.add_argument("--theme", metavar="DIR", help="take the colours from this theme folder instead of the active theme")
     make.set_defaults(run=cmd_card)
+
+    copy = commands.add_parser("copy", help="copy the last card's image to the clipboard",
+                               description="Copy a card's image to the clipboard, to paste into a post or a chat. "
+                                           "Without FILE it is the newest card in your Pictures folder.")
+    copy.add_argument("file", nargs="?", metavar="FILE", help="the card (default: the newest one)")
+    copy.add_argument("--notify", action="store_true", help="say on the desktop that the card is on the clipboard")
+    copy.set_defaults(run=cmd_copy)
+
+    show = commands.add_parser("show", help="show the last card in the file manager",
+                               description="Show a card in the file manager, selected. "
+                                           "Without FILE it is the newest card in your Pictures folder.")
+    show.add_argument("file", nargs="?", metavar="FILE", help="the card (default: the newest one)")
+    show.set_defaults(run=cmd_show)
+
+    menu = commands.add_parser("menu", help="pick one of the above from Omarchy's menu (what a middle click on the "
+                                            "widget does)",
+                               description="Pick what to do with the card from Omarchy's menu: copy the last one, "
+                                           "show it in its folder, or draw a new one.")
+    menu.set_defaults(run=cmd_menu)
 
     stats = commands.add_parser("stats", help="print the numbers behind the card",
                                 description="Print the numbers behind the card.")

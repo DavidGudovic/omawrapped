@@ -5,7 +5,7 @@ bytecode off (no __pycache__ may appear in the repository), puts the
 repository on sys.path, and provides the isolation every test depends on:
 HOME, the XDG folders and OMARCHY_PATH all point into a throwaway directory,
 git reads no configuration of the machine, and the CLI is run with stub
-versions of the three programs that would touch the live desktop.
+versions of every program that would touch the live desktop.
 """
 
 import sys
@@ -18,7 +18,6 @@ import itertools
 import json
 import os
 import random
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -230,56 +229,152 @@ def commit(repo, authored: datetime, email: str = ME, committed: datetime = None
 
 # ---- The CLI and the programs it starts ----
 
-STUBBED = ("omarchy-shell", "wl-copy", "xdg-open")
+# Every program the command starts that would reach the live desktop. Each has a stand-in, always.
+STUBBED = ("omarchy-shell", "wl-copy", "xdg-open", "nautilus", "uwsm-app", "notify-send",
+           "omarchy-notification-send", "omarchy-menu-select")
+# What the command needs besides, and that does nothing to the desktop: these are the real programs.
+TOOLS = ("rsvg-convert", "fc-match", "git")
+# Where the real tools are looked for: the system's folders, never the PATH of whoever runs the tests.
+SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+
+def real_tool(name: str):
+    """Where the real program is on this machine, or None. For the tests that need it, to skip without it."""
+    return shutil.which(name, path=SYSTEM_PATH)
+
+
+# What every stand-in runs. /usr/bin/python3 is absolute, so a stand-in starts whatever its PATH. It logs one JSON
+# list of its arguments per call (a tab or a newline in an argument stays what it was) and exits 0, unless the test
+# made it fail. wl-copy also keeps what it read on its standard input.
+STAND_IN = """#!/usr/bin/python3 -IBS
+import json, os, sys
+
+name, logs, state = %(name)s, %(logs)s, %(state)s
+arguments = [os.fsencode(argument).decode("utf-8", "backslashreplace") for argument in sys.argv[1:]]
+log = os.path.join(logs, name + ".log")
+try:
+    with open(log, encoding="utf-8") as handle:
+        number = len(handle.readlines())
+except FileNotFoundError:
+    number = 0
+if name == "wl-copy" and not sys.stdin.isatty():
+    with open(os.path.join(logs, "%%s.%%d.stdin" %% (name, number)), "wb") as handle:
+        handle.write(sys.stdin.buffer.read())
+with open(log, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(arguments) + "\\n")
+
+
+def read(*parts):
+    try:
+        with open(os.path.join(state, *parts), encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
+code = read("exit", name)
+if code is not None:
+    sys.exit(int(code))
+if name == "omarchy-shell":
+    # The sampler answers a canned reply to `status`, and "ok" to anything else unless it has been made deaf.
+    method = arguments[1] if len(arguments) > 1 else ""
+    if method == "status":
+        sys.stdout.write(read("shell-status-reply") or "")
+    elif read("shell-is-deaf") is None:
+        print("ok")
+elif name == "omarchy-menu-select":
+    # The menu answers with the label the test chose; with none, it was dismissed.
+    choice = read("menu-choice")
+    if not choice:
+        sys.exit(1)
+    sys.stdout.write(choice)
+"""
 
 
 class Stubs:
     """Stand-ins for the programs the CLI starts, which must never reach the real ones.
 
-    Each is a /bin/sh script that appends its arguments, one line per call, to
-    its own log and exits 0. omarchy-shell can also be given a canned reply to
-    `status`; it answers "ok" to anything else, as the sampler does.
+    All of STUBBED have one, in their own folder, and the PATH of a run is that folder and a second one that holds
+    links to the harmless real tools (TOOLS) and nothing else: no program of the desktop can be found by accident,
+    whatever is installed on the machine. A tool that is not installed is simulated by removing its stand-in.
+
+    Each stand-in appends its arguments to its own log, one line per call, and exits 0. omarchy-shell can also be
+    given a canned reply to `status`; it answers "ok" to anything else, as the sampler does.
     """
 
     def __init__(self, root: Path):
         self.dir = root / "stubs"
+        self.tools = root / "tools"
         self.logs = root / "stublogs"
-        self.reply = root / "shell-status-reply"
-        self.deaf = root / "shell-is-deaf"
-        self.dir.mkdir()
-        self.logs.mkdir()
+        self.state = root / "stubstate"
+        for folder in (self.dir, self.tools, self.logs, self.state, self.state / "exit"):
+            folder.mkdir()
+        self.reply = self.state / "shell-status-reply"
+        self.deaf = self.state / "shell-is-deaf"
+        self.choice = self.state / "menu-choice"
         for name in STUBBED:
             script = self.dir / name
-            lines = ["#!/bin/sh", "printf '%%s\\n' \"$*\" >> %s" % shlex.quote(str(self.logs / (name + ".log")))]
-            if name == "omarchy-shell":
-                lines.append('[ "$2" = status ] && [ -f %s ] && cat %s' % (shlex.quote(str(self.reply)),
-                                                                          shlex.quote(str(self.reply))))
-                # The sampler answers "ok" to flush and discard, unless it has been made deaf.
-                lines.append('[ "$2" != status ] && [ ! -e %s ] && echo ok' % shlex.quote(str(self.deaf)))
-            lines.append("exit 0")
-            script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            script.write_text(STAND_IN % {"name": json.dumps(name), "logs": json.dumps(str(self.logs)),
+                                          "state": json.dumps(str(self.state))}, encoding="utf-8")
             script.chmod(0o755)
+        for name in TOOLS:
+            found = real_tool(name)
+            if found:
+                (self.tools / name).symlink_to(found)
+        for name in STUBBED:
+            if shutil.which(name, path=self.path) != str(self.dir / name):
+                raise RuntimeError("%s would not be the stand-in, so a test could reach the real one" % name)
 
     @property
     def path(self) -> str:
-        """The PATH the CLI runs with: the stubs first, then the system's programs."""
-        return "%s:/usr/bin" % self.dir
+        """The PATH the CLI runs with: the stand-ins first, then the harmless tools. Nothing else."""
+        return "%s:%s" % (self.dir, self.tools)
 
-    def calls(self, name: str) -> list:
-        """The arguments of every call so far to a stubbed program, one string per call."""
+    def remove(self, *names: str) -> None:
+        """Makes programs "not installed": their stand-ins go, and the real ones cannot be reached."""
+        for name in names:
+            (self.dir / name).unlink()
+            if shutil.which(name, path=self.path):
+                raise RuntimeError("%s can still be found on the path of the tests" % name)
+
+    def fail(self, name: str, code: int = 1) -> None:
+        """From now on the stand-in exits with `code` (after logging its call, and printing nothing)."""
+        (self.state / "exit" / name).write_text(str(code), encoding="utf-8")
+
+    def choose_in_menu(self, label: str) -> None:
+        """The menu stand-in answers with this label. Without it, the menu was dismissed."""
+        self.choice.write_text(label + "\n", encoding="utf-8")
+
+    def argv(self, name: str) -> list:
+        """The arguments of every call so far to a stand-in, one list per call."""
         try:
-            return (self.logs / (name + ".log")).read_text(encoding="utf-8").splitlines()
+            lines = (self.logs / (name + ".log")).read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
             return []
+        return [json.loads(line) for line in lines]
 
-    def wait_for_call(self, name: str, timeout: float = 5.0) -> list:
-        """calls(), once there is at least one (the program may be started detached)."""
+    def calls(self, name: str) -> list:
+        """The arguments of every call so far, one string per call: the arguments, a space apart."""
+        return [" ".join(arguments) for arguments in self.argv(name)]
+
+    def stdin(self, name: str, call: int = -1) -> bytes:
+        """What a call to wl-copy read on its standard input (the last call, unless told which)."""
+        calls = len(self.argv(name))
+        return (self.logs / ("%s.%d.stdin" % (name, range(calls)[call]))).read_bytes()
+
+    def wait_for_argv(self, name: str, timeout: float = 5.0) -> list:
+        """argv(), once there is at least one call (the program may be started detached)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            found = self.calls(name)
+            found = self.argv(name)
             if found:
                 return found
             time.sleep(0.05)
+        return self.argv(name)
+
+    def wait_for_call(self, name: str, timeout: float = 5.0) -> list:
+        """calls(), once there is at least one."""
+        self.wait_for_argv(name, timeout)
         return self.calls(name)
 
     def reply_to_status(self, text: str) -> None:
@@ -288,6 +383,21 @@ class Stubs:
     def stop_answering(self) -> None:
         """From now on flush and discard get no answer, as from a shell that is hanging."""
         self.deaf.write_text("", encoding="utf-8")
+
+
+class StubbedCase(IsolatedCase):
+    """A test that calls the code under test in this process, with the stand-ins as the only desktop programs.
+
+    self.stubs is the Stubs of this test, and PATH is theirs until the test is over.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.stubs = Stubs(self.tmp)
+        patcher = mock.patch.dict(os.environ, {"PATH": self.stubs.path})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.assertEqual(shutil.which("nautilus"), str(self.stubs.dir / "nautilus"))
 
 
 def cli_env(root: Path, stubs: Stubs) -> dict:
@@ -305,7 +415,7 @@ def bytecode_dirs() -> list:
 
 
 __all__ = [
-    "IsolatedCase", "LAUNCHER", "ME", "OTHER", "PLUGIN_ID", "REPO", "SAMPLE_END", "Stubs", "bytecode_dirs", "cli_env",
-    "clock", "commit", "day_json", "git", "identity", "init_repo", "isolated_env", "make_sample", "sample_days",
-    "sample_summary", "stamp",
+    "IsolatedCase", "LAUNCHER", "ME", "OTHER", "PLUGIN_ID", "REPO", "SAMPLE_END", "STUBBED", "Stubs", "StubbedCase",
+    "bytecode_dirs", "cli_env", "clock", "commit", "day_json", "git", "identity", "init_repo", "isolated_env",
+    "make_sample", "real_tool", "sample_days", "sample_summary", "stamp",
 ]

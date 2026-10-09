@@ -8,6 +8,7 @@ import re
 import shutil
 import struct
 import subprocess
+import time
 import unittest
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
@@ -15,14 +16,23 @@ from datetime import time as time_of_day
 from pathlib import Path
 
 from omawrapped import VERSION, aggregate
-from support import (LAUNCHER, OTHER, PLUGIN_ID, IsolatedCase, Stubs, bytecode_dirs, cli_env, clock, commit,
-                     init_repo, make_sample)
+from support import (LAUNCHER, OTHER, PLUGIN_ID, STUBBED, IsolatedCase, Stubs, bytecode_dirs, cli_env, clock,
+                     commit, init_repo, make_sample, real_tool)
 
 SVG = "{http://www.w3.org/2000/svg}"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-# The CLI runs with PATH=<stubs>:/usr/bin, so that is the only place it can find the renderer.
-needs_renderer = unittest.skipUnless(os.access("/usr/bin/rsvg-convert", os.X_OK),
-                                     "/usr/bin/rsvg-convert is not installed")
+GLYPH = "\U000f154d"
+NO_CARD = "There is no card yet. Draw one with `omawrapped card`, or click the widget."
+COPY_FAILED = "wl-copy could not copy the card. Is a Wayland session running?"
+NO_WL_COPY = "wl-copy was not found (package wl-clipboard), so nothing was copied."
+NO_XDG_OPEN = "xdg-open was not found (package xdg-utils), so the card was not opened."
+NO_MENU = ("omarchy-menu-select was not found, so there is no menu to show. "
+           "`omawrapped copy` and `omawrapped show` do the same from a terminal.")
+CLICK_HINT = "Click here to show it in its folder."
+MENU = ["OmaWrapped", "\U000f018f\tCopy card", "\U000f0770\tShow in folder", "\U000f0a33\tCard of the last 7 days",
+        "\U000f0e17\tCard of the last 30 days"]
+# The CLI runs with the stand-ins and links to the harmless real tools on its PATH: the renderer is one of them.
+needs_renderer = unittest.skipUnless(real_tool("rsvg-convert"), "rsvg-convert is not installed")
 
 
 def svg_texts(path: Path) -> list:
@@ -88,6 +98,30 @@ class CliCase(IsolatedCase):
     def local(self, day: date, at: time_of_day = time_of_day(12)) -> datetime:
         return datetime.combine(day, at).astimezone()
 
+    def make_card(self, name="omawrapped-2026-10-02.png", mtime=1700000000, content=None) -> Path:
+        """A card in the Pictures folder, last modified at mtime (seconds), so that the order is not up to the clock."""
+        path = self.pictures / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(PNG_SIGNATURE + name.encode() + bytes(range(256)) if content is None else content)
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def notification(self, headline, body, image=None, click=None) -> list:
+        """The arguments omarchy-notification-send is to get: the spec's order, with --exec and its command last."""
+        argv = ["--app-name", "OmaWrapped", "-g", GLYPH]
+        if image:
+            argv += ["--image", str(image)]
+        argv += [headline, body]
+        if click:
+            argv += ["--exec", *map(str, click)]
+        return argv
+
+    def assert_nothing_started(self, *names):
+        """None of the desktop programs (except the named ones) was started."""
+        for name in STUBBED:
+            if name not in names:
+                self.assertEqual(self.stubs.argv(name), [], "%s was started" % name)
+
     def repo_with_commits(self, folder: Path) -> Path:
         """A repository whose commits fall inside, on the edge of and outside the last week. Oldest first."""
         repo = init_repo(folder / "project")
@@ -103,7 +137,7 @@ class LauncherTests(CliCase):
     def test_no_arguments_prints_help_and_exits_0(self):
         result = self.ok()
         self.assertIn("usage: omawrapped", result.stdout)
-        for command in ("card", "stats", "status", "reset"):
+        for command in ("card", "copy", "show", "menu", "stats", "status", "reset"):
             self.assertIn(command, result.stdout)
         self.assertEqual(result.stderr, "")
 
@@ -112,9 +146,22 @@ class LauncherTests(CliCase):
         self.assertEqual(result.stdout.strip(), "omawrapped " + VERSION)
 
     def test_help_of_every_command(self):
-        for command in ("card", "stats", "status", "reset"):
+        for command in ("card", "copy", "show", "menu", "stats", "status", "reset"):
             with self.subTest(command=command):
                 self.assertIn("usage: omawrapped " + command, self.ok(command, "--help").stdout)
+
+    def test_the_new_commands_say_what_they_are_for(self):
+        # argparse wraps the help to the width of the terminal, so only the words are compared.
+        words = " ".join(self.ok("--help").stdout.split())
+        for text in ("copy the last card's image to the clipboard", "show the last card in the file manager",
+                     "pick one of the above from Omarchy's menu (what a middle click on the widget does)"):
+            self.assertIn(text, words)
+
+    def test_card_has_a_notify_option_and_copy_one_too_but_show_has_none(self):
+        self.assertIn("--notify", self.ok("card", "--help").stdout)
+        self.assertIn("--notify", self.ok("copy", "--help").stdout)
+        self.assertNotIn("--notify", self.ok("show", "--help").stdout)
+        self.assertNotIn("--notify", self.ok("menu", "--help").stdout)
 
     def test_an_unknown_command_is_an_argument_error(self):
         result = self.run_cli("frobnicate")
@@ -134,7 +181,7 @@ class LauncherTests(CliCase):
         self.assertEqual(bytecode_dirs(), [])
 
     def test_the_stand_ins_come_first_on_the_path(self):
-        for name in ("omarchy-shell", "wl-copy", "xdg-open"):
+        for name in STUBBED:
             self.assertEqual(shutil.which(name, path=self.stubs.path), str(self.stubs.dir / name))
 
 
@@ -418,6 +465,14 @@ class ArgumentErrorTests(CliCase):
     def test_a_bad_copy_choice(self):
         self.assert_argument_error("card", "--copy", "everything", message="invalid choice")
 
+    def test_show_and_menu_take_no_notify_option(self):
+        self.assert_argument_error("show", "--notify", message="unrecognized arguments")
+        self.assert_argument_error("menu", "--notify", message="unrecognized arguments")
+
+    def test_copy_and_show_take_one_file_at_most(self):
+        self.assert_argument_error("copy", "a.png", "b.png", message="unrecognized arguments")
+        self.assert_argument_error("show", "a.png", "b.png", message="unrecognized arguments")
+
 
 class CardTests(CliCase):
     def test_no_data_exits_1_writes_nothing_and_says_so(self):
@@ -599,11 +654,28 @@ class CardTests(CliCase):
 
     def test_a_missing_wl_copy_is_only_a_warning(self):
         self.record()
-        (self.stubs.dir / "wl-copy").unlink()
-        # /usr/bin may hold a real wl-copy, so the path is the stand-ins' folder alone.
-        result = self.run_cli("card", "-o", self.tmp / "c.svg", PATH=str(self.stubs.dir))
+        self.stubs.remove("wl-copy")
+        result = self.run_cli("card", "-o", self.tmp / "c.svg")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("wl-copy was not found", result.stderr)
+        self.assertEqual(result.stderr, NO_WL_COPY + "\nSaved %s\n" % (self.tmp / "c.svg"))
+        self.assertEqual(result.stdout, str(self.tmp / "c.svg") + "\n")
+
+    def test_a_failing_wl_copy_is_only_a_warning_too(self):
+        self.record()
+        self.stubs.fail("wl-copy")
+        for what in ("path", "image"):
+            with self.subTest(copy=what):
+                result = self.run_cli("card", "-o", self.tmp / "c.svg", "--copy", what)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, COPY_FAILED + "\nSaved %s\n" % (self.tmp / "c.svg"))
+                self.assertEqual(result.stdout, str(self.tmp / "c.svg") + "\n")
+
+    def test_a_missing_xdg_open_is_only_a_warning(self):
+        self.record()
+        self.stubs.remove("xdg-open")
+        result = self.run_cli("card", "-o", self.tmp / "c.svg", "--copy", "none", "--open")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "Saved %s\n%s\n" % (self.tmp / "c.svg", NO_XDG_OPEN))
         self.assertEqual(result.stdout, str(self.tmp / "c.svg") + "\n")
 
     # ---- the default output: a PNG in the Pictures folder ----
@@ -657,6 +729,513 @@ class CardTests(CliCase):
         output = self.tmp / "mine.PNG"
         self.ok("card", "-o", output, "--copy", "none")
         self.assertEqual(output.read_bytes()[:8], PNG_SIGNATURE)
+
+
+class CardNotifyTests(CliCase):
+    """card --notify: the desktop is told, in one of three ways, what became of the card."""
+
+    def sent(self) -> list:
+        return self.stubs.argv("omarchy-notification-send")
+
+    def click(self, path) -> list:
+        return [str(LAUNCHER), "show", str(path)]
+
+    @needs_renderer
+    def test_an_image_on_the_clipboard_is_announced_as_copied(self):
+        self.record()
+        output = self.tmp / "c.png"
+        result = self.ok("card", "-o", output, "--copy", "image", "--notify")
+        self.assertEqual(result.stdout, str(output) + "\n")
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/png"]])
+        self.assertEqual(self.sent(), [self.notification(
+            "Card copied", "Paste it into a post. " + CLICK_HINT, image=output, click=self.click(output))])
+
+    @needs_renderer
+    def test_a_path_on_the_clipboard_is_announced_as_saved(self):
+        self.record()
+        output = self.tmp / "c.png"
+        self.ok("card", "-o", output, "--notify")
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--", str(output)]])
+        self.assertEqual(self.sent(), [self.notification(
+            "Card saved", "Its path is on the clipboard. " + CLICK_HINT, image=output, click=self.click(output))])
+
+    @needs_renderer
+    def test_nothing_on_the_clipboard_says_where_the_card_is(self):
+        self.record()
+        output = self.tmp / "c.png"
+        self.ok("card", "-o", output, "--copy", "none", "--notify")
+        self.assertEqual(self.stubs.argv("wl-copy"), [])
+        self.assertEqual(self.sent(), [self.notification(
+            "Card saved", "%s. %s" % (output, CLICK_HINT), image=output, click=self.click(output))])
+
+    @needs_renderer
+    def test_the_default_card_is_announced_with_the_path_that_was_printed(self):
+        self.record()
+        result = self.ok("card", "--copy", "image", "--notify")
+        expected = self.pictures / ("omawrapped-%s.png" % self.today.isoformat())
+        self.assertEqual(result.stdout, str(expected) + "\n")
+        self.assertEqual(self.sent(), [self.notification(
+            "Card copied", "Paste it into a post. " + CLICK_HINT, image=expected, click=self.click(expected))])
+
+    @needs_renderer
+    def test_a_png_is_a_png_whatever_the_case_of_its_name(self):
+        self.record()
+        output = self.tmp / "mine.PNG"
+        self.ok("card", "-o", output, "--copy", "none", "--notify")
+        self.assertEqual(self.sent()[0][4:6], ["--image", str(output)])
+
+    def test_the_image_of_an_svg_is_not_passed_on(self):
+        self.record()
+        output = self.tmp / "c.svg"
+        self.ok("card", "-o", output, "--copy", "image", "--notify")
+        self.assertEqual(self.sent(), [self.notification(
+            "Card copied", "Paste it into a post. " + CLICK_HINT, click=self.click(output))])
+
+    def test_a_click_runs_this_command_by_its_absolute_path(self):
+        self.record()
+        link = self.tmp / "linked-omawrapped"
+        link.symlink_to(LAUNCHER)
+        output = self.tmp / "c.svg"
+        # Even when the command was started through a link that will be gone, the click must find it.
+        self.ok("card", "-o", output, "--copy", "none", "--notify", launcher=link)
+        command = self.sent()[0][self.sent()[0].index("--exec") + 1:]
+        self.assertEqual(command, [str(LAUNCHER), "show", str(output)])
+        self.assertTrue(os.path.isabs(command[0]) and os.access(command[0], os.X_OK))
+
+    def test_a_relative_output_is_announced_by_its_absolute_path(self):
+        self.record()
+        self.ok("card", "-o", "c.svg", "--copy", "none", "--notify", cwd=self.work)
+        output = self.work / "c.svg"
+        self.assertEqual(self.sent(), [self.notification(
+            "Card saved", "%s. %s" % (output, CLICK_HINT), click=self.click(output))])
+
+    def test_without_notify_nothing_is_said(self):
+        self.record()
+        for copy in ("path", "image", "none"):
+            self.ok("card", "-o", self.tmp / "c.svg", "--copy", copy)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.stubs.argv("notify-send"), [])
+
+    def test_a_copy_that_failed_is_reported_and_the_card_is_called_saved(self):
+        self.record()
+        self.stubs.fail("wl-copy")
+        output = self.tmp / "c.svg"
+        for what in ("path", "image"):
+            with self.subTest(copy=what):
+                result = self.ok("card", "-o", output, "--copy", what, "--notify")
+                self.assertEqual(result.stderr, COPY_FAILED + "\nSaved %s\n" % output)
+                self.assertEqual(result.stdout, str(output) + "\n")
+                self.assertEqual(self.sent()[-1], self.notification(
+                    "Card saved", "%s. %s" % (output, CLICK_HINT), click=self.click(output)))
+
+    def test_a_missing_wl_copy_is_reported_and_the_card_is_called_saved(self):
+        self.record()
+        self.stubs.remove("wl-copy")
+        output = self.tmp / "c.svg"
+        result = self.ok("card", "-o", output, "--notify")
+        self.assertEqual(result.stderr, NO_WL_COPY + "\nSaved %s\n" % output)
+        self.assertEqual(self.sent(), [self.notification(
+            "Card saved", "%s. %s" % (output, CLICK_HINT), click=self.click(output))])
+
+    def test_notify_send_is_the_fallback(self):
+        self.record()
+        self.stubs.remove("omarchy-notification-send")
+        output = self.tmp / "c.svg"
+        self.ok("card", "-o", output, "--copy", "image", "--notify")
+        self.assertEqual(self.stubs.argv("notify-send"), [
+            ["-a", "OmaWrapped", "Card copied", "Paste it into a post. " + CLICK_HINT]])
+
+    @needs_renderer
+    def test_notify_send_gets_the_image(self):
+        self.record()
+        self.stubs.remove("omarchy-notification-send")
+        output = self.tmp / "c.png"
+        self.ok("card", "-o", output, "--copy", "image", "--notify")
+        self.assertEqual(self.stubs.argv("notify-send"), [
+            ["-a", "OmaWrapped", "-i", str(output), "Card copied", "Paste it into a post. " + CLICK_HINT]])
+
+    def test_without_any_notification_tool_the_card_is_still_made_and_nothing_is_said_about_it(self):
+        self.record()
+        self.stubs.remove("omarchy-notification-send", "notify-send")
+        output = self.tmp / "c.svg"
+        result = self.ok("card", "-o", output, "--copy", "none", "--notify")
+        self.assertEqual(result.stdout, str(output) + "\n")
+        self.assertEqual(result.stderr, "Saved %s\n" % output)
+
+    def test_a_notification_that_fails_does_not_fail_the_card(self):
+        self.record()
+        self.stubs.fail("omarchy-notification-send")
+        output = self.tmp / "c.svg"
+        result = self.ok("card", "-o", output, "--copy", "none", "--notify")
+        self.assertEqual(result.stdout, str(output) + "\n")
+        self.assertEqual(result.stderr, "Saved %s\n" % output)
+
+    def test_open_and_notify_together(self):
+        self.record()
+        output = self.tmp / "c.svg"
+        self.ok("card", "-o", output, "--copy", "none", "--open", "--notify")
+        self.assertEqual(self.stubs.wait_for_argv("xdg-open"), [[str(output)]])
+        self.assertEqual(len(self.sent()), 1)
+
+    def test_no_card_no_notification(self):
+        result = self.run_cli("card", "-o", self.tmp / "c.svg", "--notify")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Nothing was recorded", result.stderr)
+        self.assert_nothing_started("omarchy-shell")
+
+
+class CopyCommandTests(CliCase):
+    def test_without_a_file_the_newest_card_in_the_pictures_folder_is_copied(self):
+        self.make_card("omawrapped-2026-10-09.png", mtime=1000)
+        newest = self.make_card("omawrapped-2026-10-02.png", mtime=3000)
+        self.make_card("omawrapped-2026-09-30-month.png", mtime=2000)
+        result = self.ok("copy")
+        self.assertEqual(result.stdout, str(newest) + "\n")
+        self.assertEqual(result.stderr, "Copied %s (image)\n" % newest)
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/png"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), newest.read_bytes())
+        self.assert_nothing_started("wl-copy")
+
+    def test_other_files_in_the_pictures_folder_are_not_cards(self):
+        card = self.make_card(mtime=1000)
+        self.make_card("screenshot-2026-10-09.png", mtime=5000)
+        self.make_card("omawrapped-2026-10-09.svg", mtime=5000)
+        self.assertEqual(self.ok("copy").stdout, str(card) + "\n")
+
+    def test_the_pictures_folder_is_the_one_the_system_names(self):
+        elsewhere = self.tmp / "My Photos"
+        card = self.make_card()
+        moved = elsewhere / card.name
+        elsewhere.mkdir()
+        card.rename(moved)
+        self.assertEqual(self.ok("copy", XDG_PICTURES_DIR=str(elsewhere)).stdout, str(moved) + "\n")
+
+    def test_a_file_is_copied_instead_of_the_newest_card(self):
+        self.make_card(mtime=5000)
+        chosen = self.make_card("omawrapped-2026-01-01.png", mtime=1000, content=PNG_SIGNATURE + b"chosen")
+        result = self.ok("copy", chosen)
+        self.assertEqual(result.stdout, str(chosen) + "\n")
+        self.assertEqual(self.stubs.stdin("wl-copy"), PNG_SIGNATURE + b"chosen")
+
+    def test_a_file_need_not_be_in_the_pictures_folder_or_named_like_a_card(self):
+        file = self.write(self.work / "mine.png", "not really a png")
+        result = self.ok("copy", "mine.png")
+        self.assertEqual(result.stdout, str(file) + "\n")
+        self.assertEqual(result.stderr, "Copied %s (image)\n" % file)
+        self.assertEqual(self.stubs.stdin("wl-copy"), b"not really a png")
+
+    def test_a_tilde_means_home_and_the_path_is_printed_whole(self):
+        file = self.write(self.home / "cards" / "c.png", "x")
+        self.assertEqual(self.ok("copy", "~/cards/../cards/c.png").stdout, str(file) + "\n")
+
+    def test_an_svg_is_copied_as_an_svg(self):
+        file = self.write(self.work / "c.svg", "<svg/>")
+        self.ok("copy", file)
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/svg+xml"]])
+
+    def test_without_any_card_it_says_so(self):
+        for prepare in ("no folder", "empty folder", "other files only"):
+            with self.subTest(pictures=prepare):
+                if prepare == "empty folder":
+                    self.pictures.mkdir()
+                elif prepare == "other files only":
+                    self.make_card("screenshot.png")
+                result = self.run_cli("copy")
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, NO_CARD + "\n")
+                self.assert_nothing_started()
+
+    def test_a_file_that_does_not_exist(self):
+        self.make_card()
+        missing = self.tmp / "nowhere" / "c.png"
+        result = self.run_cli("copy", missing)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "%s does not exist.\n" % missing)
+        self.assert_nothing_started()
+
+    def test_a_folder_is_not_a_card(self):
+        result = self.run_cli("copy", self.work)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("is not a file", result.stderr)
+        self.assert_nothing_started()
+
+    def test_a_missing_wl_copy_is_an_error(self):
+        self.make_card()
+        self.stubs.remove("wl-copy")
+        result = self.run_cli("copy")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, NO_WL_COPY + "\n")
+
+    def test_a_failing_wl_copy_is_an_error(self):
+        self.make_card()
+        self.stubs.fail("wl-copy")
+        result = self.run_cli("copy")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, COPY_FAILED + "\n")
+
+    def test_notify_says_that_the_card_is_on_the_clipboard(self):
+        card = self.make_card("omawrapped-2026-10-02.png")
+        result = self.ok("copy", "--notify")
+        self.assertEqual(result.stdout, str(card) + "\n")
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(
+            "Card copied", "omawrapped-2026-10-02.png is on the clipboard. Paste it anywhere.", image=card)])
+
+    def test_notify_names_the_file_that_was_copied(self):
+        file = self.write(self.work / "mine.png", "x")
+        self.ok("copy", file, "--notify")
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(
+            "Card copied", "mine.png is on the clipboard. Paste it anywhere.", image=file)])
+
+    def test_notify_falls_back_to_notify_send(self):
+        card = self.make_card()
+        self.stubs.remove("omarchy-notification-send")
+        self.ok("copy", "--notify")
+        body = "%s is on the clipboard. Paste it anywhere." % card.name
+        self.assertEqual(self.stubs.argv("notify-send"), [["-a", "OmaWrapped", "-i", str(card), "Card copied", body]])
+
+    def test_notify_without_a_notification_tool_changes_nothing(self):
+        card = self.make_card()
+        self.stubs.remove("omarchy-notification-send", "notify-send")
+        result = self.ok("copy", "--notify")
+        self.assertEqual(result.stdout, str(card) + "\n")
+        self.assertEqual(result.stderr, "Copied %s (image)\n" % card)
+
+    def test_without_notify_nothing_is_said(self):
+        self.make_card()
+        self.ok("copy")
+        self.assert_nothing_started("wl-copy")
+
+    def test_nothing_is_said_when_the_copy_failed(self):
+        self.make_card()
+        self.stubs.fail("wl-copy")
+        self.assertEqual(self.run_cli("copy", "--notify").returncode, 1)
+        self.assert_nothing_started("wl-copy")
+
+    def test_the_sampler_is_not_involved(self):
+        self.make_card()
+        self.ok("copy")
+        self.assertEqual(self.stubs.argv("omarchy-shell"), [])
+
+
+class ShowCommandTests(CliCase):
+    def test_without_a_file_the_newest_card_is_shown(self):
+        self.make_card("omawrapped-2026-10-09.png", mtime=1000)
+        newest = self.make_card("omawrapped-2026-10-02.png", mtime=3000)
+        result = self.ok("show")
+        self.assertEqual(result.stdout, str(newest) + "\n")
+        self.assertEqual(self.stubs.wait_for_argv("uwsm-app"), [["--", "nautilus", "--select", str(newest)]])
+        self.assert_nothing_started("uwsm-app")
+
+    def test_a_file_is_shown_instead(self):
+        self.make_card(mtime=5000)
+        file = self.write(self.work / "mine.png", "x")
+        result = self.ok("show", "mine.png")
+        self.assertEqual(result.stdout, str(file) + "\n")
+        self.assertEqual(self.stubs.wait_for_argv("uwsm-app"), [["--", "nautilus", "--select", str(file)]])
+
+    def test_without_uwsm_app_nautilus_is_started_directly(self):
+        card = self.make_card()
+        self.stubs.remove("uwsm-app")
+        self.ok("show")
+        self.assertEqual(self.stubs.wait_for_argv("nautilus"), [["--select", str(card)]])
+        self.assert_nothing_started("nautilus")
+
+    def test_without_nautilus_the_folder_is_opened(self):
+        card = self.make_card()
+        self.stubs.remove("nautilus")
+        result = self.ok("show")
+        self.assertEqual(result.stdout, str(card) + "\n")
+        self.assertEqual(self.stubs.wait_for_argv("xdg-open"), [[str(self.pictures)]])
+        self.assert_nothing_started("xdg-open")
+
+    def test_without_a_file_manager_it_is_an_error_that_says_where_the_card_is(self):
+        card = self.make_card()
+        self.stubs.remove("nautilus", "xdg-open")
+        result = self.run_cli("show")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "No file manager was found to show the card in. It is at %s.\n" % card)
+        self.assert_nothing_started()
+
+    def test_without_any_card_it_says_so(self):
+        result = self.run_cli("show")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, NO_CARD + "\n")
+        self.assert_nothing_started()
+
+    def test_a_file_that_does_not_exist(self):
+        self.make_card()
+        missing = self.tmp / "nowhere" / "c.png"
+        result = self.run_cli("show", missing)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "%s does not exist.\n" % missing)
+        self.assert_nothing_started()
+
+    def test_a_click_on_a_notification_shows_the_card(self):
+        # What the notification of `card --notify` runs: the command it was given, as it was given.
+        card = self.make_card()
+        result = subprocess.run([str(LAUNCHER), "show", str(card)], capture_output=True, text=True,
+                                env=self.environment(), cwd="/", stdin=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.stubs.wait_for_argv("uwsm-app"), [["--", "nautilus", "--select", str(card)]])
+
+
+class MenuTests(CliCase):
+    def test_the_four_options_reach_the_menu_in_order_each_with_its_glyph_and_a_tab(self):
+        self.ok("menu")
+        self.assertEqual(self.stubs.argv("omarchy-menu-select"), [MENU])
+        for option in MENU[1:]:
+            glyph, tab, label = option.partition("\t")
+            self.assertEqual((len(glyph), tab), (1, "\t"), option)
+
+    def test_a_dismissed_menu_does_nothing_and_succeeds(self):
+        self.record()
+        self.make_card()
+        result = self.run_cli("menu")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assert_nothing_started("omarchy-menu-select")
+
+    def test_a_missing_menu_is_an_error(self):
+        self.stubs.remove("omarchy-menu-select")
+        result = self.run_cli("menu")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, NO_MENU + "\n")
+        self.assert_nothing_started()
+
+    def test_a_menu_that_breaks_is_an_error(self):
+        self.stubs.fail("omarchy-menu-select", 2)
+        result = self.run_cli("menu")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("omarchy-menu-select", result.stderr)
+        self.assert_nothing_started("omarchy-menu-select")
+
+    def test_an_answer_that_is_not_an_option_does_nothing(self):
+        self.make_card()
+        self.stubs.choose_in_menu("Delete everything")
+        result = self.run_cli("menu")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Delete everything", result.stderr)
+        self.assert_nothing_started("omarchy-menu-select")
+
+    def test_copy_card_copies_the_newest_card_and_says_so(self):
+        self.make_card("omawrapped-2026-10-09.png", mtime=1000)
+        newest = self.make_card("omawrapped-2026-10-02.png", mtime=3000)
+        self.stubs.choose_in_menu("Copy card")
+        result = self.ok("menu")
+        self.assertEqual(result.stdout, str(newest) + "\n")
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/png"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), newest.read_bytes())
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(
+            "Card copied", "omawrapped-2026-10-02.png is on the clipboard. Paste it anywhere.", image=newest)])
+        self.assert_nothing_started("omarchy-menu-select", "wl-copy", "omarchy-notification-send")
+
+    def test_copy_card_without_a_card_fails_as_copy_does(self):
+        self.stubs.choose_in_menu("Copy card")
+        result = self.run_cli("menu")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NO_CARD + "\n"))
+        self.assert_nothing_started("omarchy-menu-select")
+
+    def test_copy_card_with_a_failing_wl_copy_fails_as_copy_does(self):
+        self.make_card()
+        self.stubs.fail("wl-copy")
+        self.stubs.choose_in_menu("Copy card")
+        result = self.run_cli("menu")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", COPY_FAILED + "\n"))
+        self.assert_nothing_started("omarchy-menu-select", "wl-copy")
+
+    def test_show_in_folder_shows_the_newest_card(self):
+        self.make_card("omawrapped-2026-10-09.png", mtime=1000)
+        newest = self.make_card("omawrapped-2026-10-02.png", mtime=3000)
+        self.stubs.choose_in_menu("Show in folder")
+        result = self.ok("menu")
+        self.assertEqual(result.stdout, str(newest) + "\n")
+        self.assertEqual(self.stubs.wait_for_argv("uwsm-app"), [["--", "nautilus", "--select", str(newest)]])
+        self.assert_nothing_started("omarchy-menu-select", "uwsm-app")
+
+    def test_show_in_folder_without_a_card_or_a_file_manager_fails_as_show_does(self):
+        self.stubs.choose_in_menu("Show in folder")
+        result = self.run_cli("menu")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NO_CARD + "\n"))
+        card = self.make_card()
+        self.stubs.remove("nautilus", "xdg-open")
+        result = self.run_cli("menu")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "No file manager was found to show the card in. It is at %s.\n" % card)
+
+    def card_choice(self, label, suffix):
+        """The menu draws a card: it is saved, opened, its image copied, and the desktop is told."""
+        self.record()
+        self.stubs.choose_in_menu(label)
+        expected = self.pictures / ("omawrapped-%s%s.png" % (self.today.isoformat(), suffix))
+        result = self.ok("menu")
+        self.assertEqual(result.stdout, str(expected) + "\n")
+        self.assertEqual(os.listdir(self.pictures), [expected.name])
+        data = expected.read_bytes()
+        self.assertEqual(data[:8], PNG_SIGNATURE)
+        self.assertEqual(self.stubs.wait_for_argv("xdg-open"), [[str(expected)]])
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/png"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), data)
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(
+            "Card copied", "Paste it into a post. " + CLICK_HINT, image=expected,
+            click=[str(LAUNCHER), "show", str(expected)])])
+        self.assertIn("Saved %s (image copied)" % expected, result.stderr)
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "wl-copy", "xdg-open",
+                                    "omarchy-notification-send")
+        return expected
+
+    @needs_renderer
+    def test_the_card_of_the_last_7_days(self):
+        self.card_choice("Card of the last 7 days", "")
+
+    @needs_renderer
+    def test_the_card_of_the_last_30_days(self):
+        self.card_choice("Card of the last 30 days", "-month")
+
+    @needs_renderer
+    def test_the_two_cards_cover_the_periods_they_name(self):
+        self.record()
+        self.stubs.choose_in_menu("Card of the last 7 days")
+        self.ok("menu")
+        self.stubs.choose_in_menu("Card of the last 30 days")
+        self.ok("menu")
+        self.assertEqual(sorted(os.listdir(self.pictures)), [
+            "omawrapped-%s-month.png" % self.today.isoformat(), "omawrapped-%s.png" % self.today.isoformat()])
+
+    def test_a_card_without_data_fails_as_card_does(self):
+        for label in ("Card of the last 7 days", "Card of the last 30 days"):
+            with self.subTest(label=label):
+                self.stubs.choose_in_menu(label)
+                result = self.run_cli("menu")
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("Nothing was recorded", result.stderr)
+                self.assertFalse(self.pictures.exists())
+                self.assert_nothing_started("omarchy-menu-select", "omarchy-shell")
+
+    @needs_renderer
+    def test_the_menu_asks_the_sampler_to_flush_before_it_draws(self):
+        self.record()
+        self.sampler()
+        self.stubs.choose_in_menu("Card of the last 7 days")
+        self.ok("menu")
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " status", PLUGIN_ID + " flush"])
+
+    @needs_renderer
+    def test_a_viewer_that_is_not_there_is_a_warning_not_a_failure(self):
+        self.record()
+        self.stubs.remove("xdg-open")
+        self.stubs.choose_in_menu("Card of the last 7 days")
+        result = self.ok("menu")
+        self.assertIn(NO_XDG_OPEN, result.stderr)
+        self.assertEqual(len(self.stubs.argv("omarchy-notification-send")), 1)
 
 
 class StatusTests(CliCase):
@@ -718,6 +1297,59 @@ class StatusTests(CliCase):
         out = self.ok("status").stdout
         self.assertRegex(out, r"(?m)^Renderer\s+rsvg-convert (found|MISSING)")
         self.assertRegex(out, r"(?m)^Clipboard\s+wl-copy found")
+
+    def status_lines(self, **kwargs) -> list:
+        return self.ok("status", **kwargs).stdout.splitlines()
+
+    def test_the_new_lines_follow_the_clipboard_line_in_this_order(self):
+        lines = self.status_lines()
+        first = next(number for number, line in enumerate(lines) if line.startswith("Clipboard"))
+        self.assertEqual(lines[first:first + 4], [
+            "Clipboard wl-copy found", "Notify    omarchy-notification-send found",
+            "Menu      omarchy-menu-select found", "Files     nautilus found"])
+
+    def test_the_notification_tool(self):
+        self.assertIn("Notify    omarchy-notification-send found", self.status_lines())
+        self.stubs.remove("omarchy-notification-send")
+        self.assertIn("Notify    notify-send found", self.status_lines())
+        self.stubs.remove("notify-send")
+        self.assertIn("Notify    MISSING (no notifications; results are still printed)", self.status_lines())
+
+    def test_omarchys_tool_alone_is_enough(self):
+        self.stubs.remove("notify-send")
+        self.assertIn("Notify    omarchy-notification-send found", self.status_lines())
+
+    def test_the_menu_tool(self):
+        self.assertIn("Menu      omarchy-menu-select found", self.status_lines())
+        self.stubs.remove("omarchy-menu-select")
+        self.assertIn("Menu      MISSING (the widget's middle-click menu needs Omarchy's menu)", self.status_lines())
+
+    def test_the_file_manager(self):
+        self.assertIn("Files     nautilus found", self.status_lines())
+        # uwsm-app only decides how nautilus is started.
+        self.stubs.remove("uwsm-app")
+        self.assertIn("Files     nautilus found", self.status_lines())
+        self.stubs.remove("nautilus")
+        self.assertIn("Files     xdg-open only (opens the folder without selecting the card)", self.status_lines())
+        self.stubs.remove("xdg-open")
+        self.assertIn("Files     MISSING", self.status_lines())
+
+    def test_nautilus_is_found_without_xdg_open(self):
+        self.stubs.remove("xdg-open")
+        self.assertIn("Files     nautilus found", self.status_lines())
+
+    def test_a_machine_with_none_of_it_says_so_on_every_line(self):
+        self.stubs.remove(*[name for name in STUBBED if name != "omarchy-shell"])
+        lines = self.status_lines()
+        for expected in ("Clipboard wl-copy MISSING (package wl-clipboard)",
+                         "Notify    MISSING (no notifications; results are still printed)",
+                         "Menu      MISSING (the widget's middle-click menu needs Omarchy's menu)",
+                         "Files     MISSING"):
+            self.assertIn(expected, lines)
+
+    def test_looking_starts_none_of_them(self):
+        self.ok("status")
+        self.assert_nothing_started("omarchy-shell")
 
     def test_counts_repositories(self):
         repos = self.tmp / "repos"
@@ -858,7 +1490,11 @@ class IsolationTests(CliCase):
         for name in ("HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_DATA_DIRS", "XDG_PICTURES_DIR", "OMARCHY_PATH",
                      "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL"):
             self.assertTrue(env[name].startswith(str(self.tmp)), "%s=%s" % (name, env[name]))
-        self.assertEqual(env["PATH"], "%s:/usr/bin" % (self.tmp / "stubs"))
+        # The stand-ins, and links to the harmless tools: no folder of the machine, so no real desktop program.
+        self.assertEqual(env["PATH"], "%s:%s" % (self.tmp / "stubs", self.tmp / "tools"))
+        self.assertEqual(sorted(path.name for path in (self.tmp / "tools").iterdir() if path.name in STUBBED), [])
+        for folder in env["PATH"].split(":"):
+            self.assertTrue(folder.startswith(str(self.tmp)), folder)
         for name in ("WAYLAND_DISPLAY", "DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "SSH_AUTH_SOCK"):
             self.assertNotIn(name, env)
 
@@ -875,20 +1511,55 @@ class IsolationTests(CliCase):
         self.assertEqual(dict(os.environ), before)
         self.assertFalse(inner.tmp.exists())
 
+    def test_every_stand_in_hides_the_real_program_when_it_is_removed(self):
+        for name in STUBBED:
+            with self.subTest(name=name):
+                folder = self.tmp / ("again-" + name)
+                folder.mkdir()
+                stubs = Stubs(folder)
+                stubs.remove(name)
+                self.assertIsNone(shutil.which(name, path=stubs.path))
+
     def test_every_command_only_ever_reached_the_stand_ins(self):
         self.record()
         self.sampler()
         repos = self.tmp / "repos"
         self.repo_with_commits(repos)
+        card = self.make_card()
         self.ok("stats")
         self.ok("status")
-        self.ok("card", "-o", self.tmp / "c.svg", "--open", "--repos", repos)
-        self.stubs.wait_for_call("xdg-open")
+        self.ok("card", "-o", self.tmp / "c.svg", "--open", "--notify", "--repos", repos)
+        self.ok("copy", "--notify")
+        self.ok("copy", self.tmp / "c.svg")
+        self.ok("show")
+        self.ok("show", self.tmp / "c.svg")
+        self.ok("menu")
+        for label in ("Copy card", "Show in folder"):
+            self.stubs.choose_in_menu(label)
+            self.ok("menu")
         self.ok("reset", "--yes")
+        self.stubs.wait_for_argv("xdg-open")
+        deadline = time.monotonic() + 5
+        while len(self.stubs.argv("uwsm-app")) < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
         status, flush, discard = (PLUGIN_ID + " " + method for method in ("status", "flush", "discard"))
         self.assertEqual(self.stubs.calls("omarchy-shell"), [status, flush, status, status, flush, status, discard])
-        self.assertEqual(self.stubs.calls("wl-copy"), ["-- " + str(self.tmp / "c.svg")])
+        self.assertEqual(self.stubs.argv("wl-copy"), [
+            ["--", str(self.tmp / "c.svg")], ["--type", "image/png"], ["--type", "image/svg+xml"],
+            ["--type", "image/png"]])
         self.assertEqual(self.stubs.calls("xdg-open"), [str(self.tmp / "c.svg")])
+        self.assertEqual(self.stubs.argv("uwsm-app"), [
+            ["--", "nautilus", "--select", str(card)], ["--", "nautilus", "--select", str(self.tmp / "c.svg")],
+            ["--", "nautilus", "--select", str(card)]])
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [
+            self.notification("Card saved", "Its path is on the clipboard. " + CLICK_HINT,
+                              click=[str(LAUNCHER), "show", str(self.tmp / "c.svg")]),
+            self.notification("Card copied", "%s is on the clipboard. Paste it anywhere." % card.name, image=card),
+            self.notification("Card copied", "%s is on the clipboard. Paste it anywhere." % card.name, image=card)])
+        self.assertEqual(len(self.stubs.argv("omarchy-menu-select")), 3)
+        # Nothing but the stand-ins can have been reached, so nothing else was.
+        self.assertEqual(self.stubs.argv("nautilus"), [])
+        self.assertEqual(self.stubs.argv("notify-send"), [])
 
 
 if __name__ == "__main__":
