@@ -3036,6 +3036,15 @@ class MainInProcessTests(StubbedCase):
             self.assertEqual(self.main("today", "--notify")[0], 3)
         self.assertEqual(self.bus.notifications(), [notification("OmaWrapped", "The last thing")])
 
+    def test_a_desktop_that_would_not_listen_is_not_asked_a_second_time(self):
+        # `today --notify` fails because the desktop refused. Asking it again, to say that, would only wait again.
+        with mock.patch.object(cli.share, "notify", return_value=False) as asked:
+            status, out, err = self.main("today", "--notify")
+        self.assertEqual((status, asked.call_count), (1, 1))
+        self.assertIn("Today could not be shown on the desktop", err)
+        # The next run asks again: a refusal is not remembered beyond the run it happened in.
+        self.assertEqual(self.main("copy", "--notify"), (3, "", NO_CARD + "\n"))
+
     def test_what_a_run_said_is_forgotten_by_the_next_run(self):
         self.assertEqual(self.main("copy")[0], 1)
         self.assertEqual(cli._said, [NO_CARD])

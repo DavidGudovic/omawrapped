@@ -21,6 +21,9 @@ SAID_ON_DESKTOP = 3
 
 # What _say has said in this run, in order. main() starts it afresh: the tests call main() again and again.
 _said = []
+# True once the desktop has not taken a notification in this run. It is then not asked again, to hear why the
+# run failed: that would only wait a second time for the same silence.
+_deaf = False
 
 
 def _say(message: str) -> None:
@@ -234,6 +237,8 @@ def _today(notify: bool) -> int:
         if paused:
             body = body + " · counting is paused" if body else "Counting is paused."
         if not share.notify("Today: " + total, body):
+            global _deaf
+            _deaf = True
             _say("Today could not be shown on the desktop: %s. `omawrapped today` in a terminal prints it." % (
                 share.cannot_notify() or "the notification service did not answer"))
             return 1
@@ -691,14 +696,16 @@ def parser() -> argparse.ArgumentParser:
 def _say_on_desktop() -> bool:
     """Whether the last thing _say said, its first line, has been said on the desktop as well."""
     lines = _said[-1].strip().splitlines() if _said else []
-    return bool(lines) and share.notify(share.APP_NAME, lines[0])
+    return bool(lines) and not _deaf and share.notify(share.APP_NAME, lines[0])
 
 
 def main(argv=None) -> int:
     # `omawrapped stats | head` closes the pipe early; end quietly like any
     # other command instead of printing a traceback.
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    global _deaf
     _said.clear()
+    _deaf = False
     root = parser()
     args = root.parse_args(argv)
     if not args.command:

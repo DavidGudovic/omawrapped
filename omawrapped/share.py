@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 from . import system
@@ -191,22 +192,33 @@ def notify(headline: str, body: str = "", image: Path = None, click: list = None
         # app name, id to replace, app icon, summary, body, actions, hints, the server's own expiry time
         message = GLib.Variant("(susssasa{sv}i)", (APP_NAME, 0, "", headline, body, [], hints, -1))
         flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
-        connection = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
+        # One limit for the whole exchange. Something that takes the connection and then says nothing would
+        # otherwise keep this command, and the widget that waits for it, for good.
+        patience = Gio.Cancellable()
+        limit = threading.Timer(TIMEOUT, patience.cancel)
+        limit.daemon = True
+        limit.start()
         try:
-            connection.call_sync(NOTIFICATIONS, "/org/freedesktop/Notifications", NOTIFICATIONS, "Notify", message,
-                                 GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, TIMEOUT * 1000, None)
+            connection = Gio.DBusConnection.new_for_address_sync(address, flags, None, patience)
+            try:
+                connection.call_sync(NOTIFICATIONS, "/org/freedesktop/Notifications", NOTIFICATIONS, "Notify",
+                                     message, GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, int(TIMEOUT * 1000),
+                                     patience)
+            finally:
+                _hang_up(connection, patience, GLib)
         finally:
-            _hang_up(connection, GLib)
-    # GLib.Error: no bus or no service there. The others: text that cannot be sent, such as half a character.
+            limit.cancel()
+    # GLib.Error: no bus, no service there, or no answer in time. The others: text that cannot be sent, such as
+    # half a character.
     except (GLib.Error, TypeError, ValueError):
         return False
     return True
 
 
-def _hang_up(connection, GLib) -> None:
+def _hang_up(connection, patience, GLib) -> None:
     """Closes the connection. A notification that was taken stays taken if the goodbye fails."""
     try:
-        connection.close_sync(None)
+        connection.close_sync(patience)
     except GLib.Error:
         pass
 

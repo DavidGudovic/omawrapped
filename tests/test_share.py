@@ -3,7 +3,9 @@ import support  # noqa: F401  (must stay first: it disables bytecode and isolate
 import json
 import os
 import shutil
+import socket
 import subprocess
+import threading
 import unittest
 import warnings
 from pathlib import Path
@@ -579,6 +581,22 @@ class BusAddressTests(ShareCase):
         self.assertIsNone(share._bus_address())
         os.environ["DBUS_SESSION_BUS_ADDRESS"] = ""
         self.assertIsNone(share._bus_address())
+
+    def test_something_that_takes_the_connection_and_never_answers_is_given_up_on(self):
+        # Not a bus: a socket that accepts and then says nothing. Without a limit the command would wait for
+        # good, and so would the widget that started it.
+        listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(listener.close)
+        listener.bind(str(self.run_dir / "bus"))
+        listener.listen(1)
+        answers = []
+        # In a thread of its own, so that a sender without a limit fails this test instead of stopping them all.
+        sender = threading.Thread(target=lambda: answers.append(share.notify("Today: 1h 00m", "Zed 1h 00m")),
+                                  daemon=True)
+        with mock.patch.object(share, "TIMEOUT", 0.3):
+            sender.start()
+            sender.join(5)
+        self.assertEqual(answers, [False])
 
     def test_an_address_that_asks_for_a_bus_to_be_started_is_not_one(self):
         # "autolaunch:" would have a bus started for the command; it only ever uses one that is there.
