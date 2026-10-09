@@ -72,12 +72,14 @@ Options for `card`:
 | `-o FILE` | Save somewhere else. A name ending in `.svg` saves the drawing itself. |
 | `--copy path\|image\|none` | Put the file's path on the clipboard (default), the image itself (paste it straight into a post), or nothing. |
 | `--open` | Open the card when it is done. |
-| `--notify` | Say on the desktop that the card is ready. Clicking the notification shows the card in its folder. |
+| `--notify` | Say on the desktop that the card is ready, or why it is not. Clicking the notification shows the card in its folder. |
 | `--exclude APP` | Leave an app out of the app list, by name or window class. Repeatable. Its time still counts as screen time. |
 | `--repos DIR` | Look for git repositories here instead of the configured folders. Repeatable. |
 | `--theme DIR` | Take the colours from another theme folder, for example `/usr/share/omarchy/themes/nord`. |
 
 The card's file name carries the date of its last day, so making the same card twice in a day replaces the first.
+
+A command that fails ends with status 1. With `--notify`, or from the menu, one that has said on the desktop why it failed ends with 3 instead.
 
 ### Sharing a card
 
@@ -163,10 +165,10 @@ Everything below ships with Omarchy, so there is normally nothing to add. `omawr
 |---|---|---|
 | `python` 3.11 or later | the `omawrapped` command | no card; the widget still counts |
 | `librsvg` (`rsvg-convert`) | turning the drawing into a PNG | `omawrapped card -o card.svg` still works |
-| `python-gobject` with Pango | measuring text so nothing overflows | widths are estimated for a monospace font |
+| `python-gobject` (Pango, Gio) | measuring text so nothing overflows; sending notifications | widths are estimated for a monospace font; nothing is announced |
 | `wl-clipboard` (`wl-copy`) | copying the card or its path | nothing is copied; the card is still saved |
 | `xdg-utils` (`xdg-open`) | opening the card after a click | the card is saved but not opened |
-| `omarchy-notification-send` (part of Omarchy; `notify-send` otherwise) | saying that the card is ready | nothing is announced |
+| `omarchy-notification-send` (part of Omarchy) | the widget's own short note when the command could not run | that note is not shown |
 | `omarchy-menu-select` (part of Omarchy) | the middle-click menu | no menu; `omawrapped copy` and `omawrapped show` still work |
 | `omarchy-bar` (part of Omarchy) | pausing, and changing the settings | no pause; the widget still counts |
 | `nautilus` | showing the card in its folder | the folder is opened with `xdg-open`, the card not selected |
@@ -208,11 +210,13 @@ An app is named by its window class, such as `chromium` or `com.mitchellh.ghostt
 
 **What is never recorded.** Window titles, page addresses (of a web app, only the site's host name, as above), file names, what you type, the commands you run, screenshots, or anything else about what happens inside an app. The service does not read window titles at all. The files hold no time finer than the hour of the day.
 
-**Where it is.** `~/.local/share/omawrapped/days/`, one `YYYY-MM-DD.json` per day, in a folder only your user can open (mode 700; the service makes it so again if the folder is ever deleted and recreated). Nothing is stored anywhere else, and nothing is ever sent anywhere: the plugin contains no network code.
+**Where it is.** `~/.local/share/omawrapped/days/`, one `YYYY-MM-DD.json` per day, in a folder only your user can open (mode 700; the service makes it so again if the folder is ever deleted and recreated). The day files are closed to other users as well (mode 600). Nothing is stored anywhere else, and nothing is ever sent anywhere: the plugin contains no network code.
 
 **What drawing a card reads.** The day files; `git log` in your own repositories (commit ids, author dates and author e-mails, to count yours; never messages or contents, and nothing is fetched); the colours and name of your theme; the number of folders in `~/.config/omarchy/plugins`; its own settings in `shell.json`; and the names in your `.desktop` files, to show "Files" instead of `org.gnome.Nautilus`. All of it read-only.
 
 **Sharing.** Copying a card puts the picture on your clipboard, and Omarchy's clipboard history keeps it like anything else you copy. Nothing is uploaded or sent anywhere: posting the card is something you do yourself.
+
+**Other users of the machine.** What a program is started with can be read by every user of a machine, in the process list. OmaWrapped puts nothing about what you did there. Notifications are sent by the command itself, over your session bus, and not through a program that takes the text as arguments. The clipboard gets its picture or path through standard input. `git` is run inside each repository instead of being told where it is. The one thing of yours that does appear is the path of a card, when the image viewer or the file manager is asked to open it. Cards are saved readable by you alone (mode 600); change that with `chmod` if another user of the machine should be able to open the file.
 
 **Keeping an app out.** Add its window class to `ignoreApps` and it is no longer recorded: time in it does not count at all. Capitals do not matter, and a web app is matched by its site whatever page it is on. An ignored app is also left off cards for days recorded before you ignored it, though its earlier time stays in those days' files until you reset. `omawrapped status` shows what is being ignored. To keep an app off one card only, use `omawrapped card --exclude`.
 
@@ -226,8 +230,8 @@ Disabling the plugin loses this list: see [Remove](#remove).
 |---|---|---|
 | `~/.config/omarchy/plugins/io.github.davidgudovic.omawrapped/` | the plugin itself | `omarchy plugin remove` |
 | the widget's entry in `~/.config/omarchy/shell.json` | position and settings, written by Omarchy when you enable or configure the widget | `omarchy plugin disable` or `remove`, settings included |
-| `~/.local/share/omawrapped/` | the recorded days | `omawrapped reset` while the plugin is in use; deleting the folder once it is removed |
-| `~/Pictures/omawrapped-*.png` | cards you asked for | you |
+| `~/.local/share/omawrapped/` | the recorded days, readable by you only | `omawrapped reset` while the plugin is in use; deleting the folder once it is removed |
+| `~/Pictures/omawrapped-*.png` | cards you asked for, readable by you only | you |
 | `~/.local/bin/omawrapped` | the link, if you made it | you |
 
 OmaWrapped writes nothing else. It installs no service, timer or autostart entry, and it does not edit your configuration.
@@ -260,9 +264,11 @@ To stop counting for a while without removing anything, pause it: see [Pausing](
 tests/check.sh               # everything: accounting, command, manifest, service and widget, all headless
 tests/screenshots.sh         # redraw the pictures in this README from the code, in a temporary home
 tests/live.sh 300            # run the real sampler against your session for 5 minutes, without installing
-tests/live.sh 300 /tmp/ow    # the same, keeping what it recorded: XDG_DATA_HOME=/tmp/ow bin/omawrapped stats
-tests/make_sample.py /tmp/ow --repos && XDG_DATA_HOME=/tmp/ow/data bin/omawrapped card --repos /tmp/ow/repos -o /tmp/ow/card.png
+tests/live.sh 300 ~/ow-try   # the same, keeping what it recorded: XDG_DATA_HOME=~/ow-try bin/omawrapped stats
+tests/make_sample.py ~/ow-try --repos && XDG_DATA_HOME=~/ow-try/data bin/omawrapped card --repos ~/ow-try/repos -o ~/ow-try/card.png
 ```
+
+The tests see notifications on a D-Bus daemon of their own, started by `tests/fake_bus.py` (it needs `dbus-daemon`, from the `dbus` package). They never use your session's bus.
 
 `Tracker.js` is the accounting, as pure functions. `Service.qml` connects it to the session and the disk. `BarWidget.qml` is the bar widget. `omawrapped/` is the command: `store` reads the day files, `aggregate` sums them, `gitstats` counts commits, `system` reads theme and names, `card` draws, `render` measures text and calls `rsvg-convert`. `tests/check.sh` needs `node`, plus the system Python, `jq` and Quickshell that Omarchy already has, and touches neither your session, your clipboard nor your recorded data. `tests/live.sh` only listens to your session, and records into a temporary folder.
 

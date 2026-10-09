@@ -8,8 +8,10 @@
 # throwaway directory, never to ~/.local/share/omawrapped. Use the desktop
 # normally while it runs; leave it alone for half a minute to see it pause.
 #
-# Give a second argument to keep what was recorded, and draw a card from it:
-#   tests/live.sh 300 /tmp/ow && XDG_DATA_HOME=/tmp/ow bin/omawrapped card -o /tmp/ow/card.png
+# Give a second argument to keep what was recorded, and draw a card from it.
+# What is recorded is real, so keep it in your home and not in /tmp, where
+# another user could have made the folder first:
+#   tests/live.sh 300 ~/ow-try && XDG_DATA_HOME=~/ow-try bin/omawrapped card -o ~/ow-try/card.png
 set -eu
 
 SECONDS_TO_RUN=${1:-300}
