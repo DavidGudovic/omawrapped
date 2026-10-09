@@ -4,8 +4,10 @@ Import this module before anything else in a test module. It switches
 bytecode off (no __pycache__ may appear in the repository), puts the
 repository on sys.path, and provides the isolation every test depends on:
 HOME, the XDG folders and OMARCHY_PATH all point into a throwaway directory,
-git reads no configuration of the machine, and the CLI is run with stub
-versions of every program that would touch the live desktop.
+git reads no configuration of the machine, the session bus is one that does
+not exist, and the CLI is run with stub versions of every program that would
+touch the live desktop. A test that wants to see a notification starts a bus
+of its own (Bus), a private one with a stand-in for the notification service.
 """
 
 import sys
@@ -18,6 +20,7 @@ import itertools
 import json
 import os
 import random
+import select
 import shutil
 import subprocess
 import tempfile
@@ -53,6 +56,8 @@ with warnings.catch_warnings():
 
 ME = "me@example.invalid"
 OTHER = "someone.else@example.invalid"
+# The plugin's bar icon, as share.GLYPH: written out again here, so that a change of the icon is seen by the tests.
+GLYPH = "\U000f154d"
 # The last day of the fixture periods: fixed, so no test depends on the date it runs.
 SAMPLE_END = date(2026, 10, 9)
 
@@ -71,6 +76,9 @@ def isolated_env(root: Path) -> dict:
         "XDG_RUNTIME_DIR": str(root / "run"),
         "XDG_DATA_DIRS": str(root / "share"),
         "XDG_PICTURES_DIR": str(root / "Pictures"),
+        # No session bus: a notification sent by the code under test must never reach the real desktop. A test
+        # that wants to see one starts tests/fake_bus.py and puts its address here.
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=%s" % (root / "run" / "no-bus"),
         "OMARCHY_PATH": str(root / "omarchy"),
         # git reads no configuration but the repository's own.
         "GIT_CONFIG_GLOBAL": str(root / "gitconfig"),
@@ -84,10 +92,43 @@ class IsolatedCase(unittest.TestCase):
     self.tmp is a fresh temporary directory that holds the whole fake
     machine: self.home, the data folder, the Omarchy tree and so on.
     os.environ is patched for the length of the test and restored after it.
+
+    A test case that wants to see notifications sets needs_bus: one Bus is started for all its tests (self.bus),
+    and what it was told is cleared before each test. A run gets it by `**self.on_bus` among its extra variables;
+    without that it has no bus, as isolated_env() says.
     """
+
+    needs_bus = False
+    bus = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if cls.needs_bus:
+            cls.bus = Bus()
+            cls.addClassCleanup(cls.bus.stop)
+
+    @property
+    def on_bus(self) -> dict:
+        """The variable that points a run at the test bus."""
+        if self.bus is None:
+            raise RuntimeError("%s has no bus: set needs_bus" % type(self).__name__)
+        return {"DBUS_SESSION_BUS_ADDRESS": self.bus.address}
+
+    def set_umask(self, mask: int) -> None:
+        """For the rest of the test, the files this process makes are made under this umask."""
+        self.addCleanup(os.umask, os.umask(mask))
+
+    def use_bus(self) -> None:
+        """For the rest of the test, what runs in this process finds the test bus."""
+        patcher = mock.patch.dict(os.environ, self.on_bus)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def setUp(self):
         super().setUp()
+        if self.bus:
+            self.bus.reset()
         holder = tempfile.TemporaryDirectory(prefix="omawrapped-test-")
         self.addCleanup(holder.cleanup)
         self.tmp = Path(holder.name).resolve()
@@ -136,6 +177,103 @@ def day_json(day: date, active_ms=0, hours_ms=None, apps_ms=None, switches=0) ->
         "apps_ms": {} if apps_ms is None else apps_ms,
         "switches": switches,
     }
+
+
+# ---- The session bus ----
+
+class Bus:
+    """A session bus of its own, with a stand-in for the desktop's notification service. See tests/fake_bus.py.
+
+    It is a private D-Bus daemon in a program of its own: nothing here can reach the real session bus, so the
+    person whose machine the tests run on is never notified. It gets nothing from the environment of the tests.
+    Starting it takes a moment, so a test case starts one for all its tests; stop() ends it, by its process id.
+    """
+
+    def __init__(self):
+        self._holder = tempfile.TemporaryDirectory(prefix="omawrapped-bus-")
+        root = Path(self._holder.name).resolve()
+        for name in ("home", "run"):
+            (root / name).mkdir()
+        self.log = root / "notifications.log"
+        self._refusal = Path(str(self.log) + ".refuse")
+        env = {"PATH": "/usr/bin", "HOME": str(root / "home"), "XDG_RUNTIME_DIR": str(root / "run"),
+               "TMPDIR": str(root)}
+        self._errors = root / "errors.log"
+        with open(self._errors, "wb") as errors:
+            self.process = subprocess.Popen(
+                ["/usr/bin/python3", "-B", str(TESTS / "fake_bus.py"), str(self.log)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors, env=env, cwd=str(root))
+        try:
+            self.address = self._wait_for_address()
+        except BaseException:
+            self.stop()
+            raise
+
+    def _wait_for_address(self, timeout: float = 20.0) -> str:
+        """The line the stand-in prints once the bus can be used."""
+        deadline = time.monotonic() + timeout
+        out = self.process.stdout.fileno()
+        text = b""
+        while b"\n" not in text:
+            ready, _, _ = select.select([out], [], [], max(0.0, deadline - time.monotonic()))
+            chunk = os.read(out, 4096) if ready else b""
+            if not chunk:
+                raise RuntimeError("the test bus did not start in time or ended early: %s" % (
+                    self._errors.read_text(encoding="utf-8", errors="replace").strip() or "no message"))
+            text += chunk
+        return text.splitlines()[0].decode("utf-8")
+
+    def notifications(self) -> list:
+        """What the stand-in service has been sent, one dict per notification, oldest first."""
+        try:
+            lines = self.log.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        return [json.loads(line) for line in lines]
+
+    def clear(self) -> None:
+        self.log.unlink(missing_ok=True)
+
+    def refuse(self, on: bool) -> None:
+        """While on, the service answers every notification with an error, as a desktop without one would."""
+        if on:
+            self._refusal.write_text("", encoding="utf-8")
+        else:
+            self._refusal.unlink(missing_ok=True)
+
+    def reset(self) -> None:
+        """Before a test: nothing has been said, and the service takes what it is given."""
+        self.clear()
+        self.refuse(False)
+
+    def stop(self) -> None:
+        """Ends the stand-in (SIGTERM to its own process id and no other) and removes its folder."""
+        process = self.process
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        process.stdout.close()
+        self._holder.cleanup()
+
+
+def notification(headline, body="", image=None, click=None) -> dict:
+    """What the test bus has been sent for share.notify(headline, body, image, click).
+
+    The hints are those of Omarchy's own notification tool: the shell takes the icon from omarchy-glyph and runs
+    omarchy-exec-argv, the click command as a JSON array of its words.
+    """
+    hints = {"urgency": 0, "omarchy-glyph": GLYPH}
+    if image:
+        hints["image-path"] = str(image)
+    if click:
+        words = [str(word) for word in click]
+        hints["omarchy-exec-argv"] = json.dumps(words, ensure_ascii=False, separators=(",", ":"))
+    return {"app": "OmaWrapped", "replaces": 0, "icon": "", "summary": headline, "body": body, "actions": [],
+            "hints": hints, "expire": -1}
 
 
 # ---- Sample data ----
@@ -310,6 +448,21 @@ elif name == "omarchy-menu-select":
 """
 
 
+# What a spy runs: it logs the call as a stand-in does, and the folder it was started in, then becomes the real
+# program, which gets the same arguments and the same standard input.
+SPY = """#!/usr/bin/python3 -IBS
+import json, os, sys
+
+name, real, logs = %(name)s, %(real)s, %(logs)s
+arguments = [os.fsencode(argument).decode("utf-8", "backslashreplace") for argument in sys.argv[1:]]
+with open(os.path.join(logs, name + ".log"), "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(arguments) + "\\n")
+with open(os.path.join(logs, name + ".cwd"), "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(os.getcwd()) + "\\n")
+os.execv(real, [name] + sys.argv[1:])
+"""
+
+
 class Stubs:
     """Stand-ins for the programs the CLI starts, which must never reach the real ones.
 
@@ -320,6 +473,10 @@ class Stubs:
     Each stand-in appends its arguments to its own log, one line per call, and exits 0. omarchy-shell can also be
     given a canned reply to `status`, or one reply after the other; it answers "ok" to anything else, as the sampler
     does. omarchy-bar reports `set` as Omarchy does and changes nothing: no test can alter the real configuration.
+
+    Two of the stand-ins, omarchy-notification-send and notify-send, are there to be found unused: a notification
+    is sent over the session bus, and nothing of what it says may be given to a program as an argument. A spy
+    (spy()) takes the place of one of the harmless real tools and records its calls, then runs the real one.
     """
 
     def __init__(self, root: Path):
@@ -376,6 +533,23 @@ class Stubs:
         (self.tools / name).unlink(missing_ok=True)
         self._write_stand_in(self.tools / name)
 
+    def spy(self, name: str) -> None:
+        """Puts a spy in place of a harmless real tool (one of TOOLS): it logs its calls, then runs the real one.
+
+        What it logs is read by argv() like the calls to a stand-in, and the folder each call was started in by
+        cwds(). The real program does its work, so the card is still drawn and the commits are still counted.
+        """
+        if name not in TOOLS:
+            raise ValueError("%s is not one of the harmless tools" % name)
+        found = real_tool(name)
+        if not found:
+            raise unittest.SkipTest("%s is not installed" % name)
+        (self.tools / name).unlink(missing_ok=True)
+        script = self.tools / name
+        script.write_text(SPY % {"name": json.dumps(name), "real": json.dumps(found),
+                                 "logs": json.dumps(str(self.logs))}, encoding="utf-8")
+        script.chmod(0o755)
+
     def choose_in_menu(self, label: str) -> None:
         """The menu stand-in answers with this label. Without it, the menu was dismissed."""
         self.choice.write_text(label + "\n", encoding="utf-8")
@@ -387,6 +561,18 @@ class Stubs:
         except FileNotFoundError:
             return []
         return [json.loads(line) for line in lines]
+
+    def cwds(self, name: str) -> list:
+        """The folder every call so far to a spy was started in."""
+        try:
+            lines = (self.logs / (name + ".cwd")).read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        return [json.loads(line) for line in lines]
+
+    def everything(self) -> dict:
+        """{program: the arguments of each of its calls} for every stand-in and spy that was started at all."""
+        return {log.stem: self.argv(log.stem) for log in sorted(self.logs.glob("*.log"))}
 
     def calls(self, name: str) -> list:
         """The arguments of every call so far, one string per call: the arguments, a space apart."""
@@ -464,7 +650,7 @@ def bytecode_dirs() -> list:
 
 
 __all__ = [
-    "IsolatedCase", "LAUNCHER", "ME", "OTHER", "PLUGIN_ID", "REPO", "SAMPLE_END", "STUBBED", "Stubs", "StubbedCase",
-    "bytecode_dirs", "cli_env", "clock", "commit", "day_json", "git", "identity", "init_repo", "isolated_env",
-    "make_sample", "real_tool", "sample_days", "sample_summary", "stamp",
+    "Bus", "GLYPH", "IsolatedCase", "LAUNCHER", "ME", "OTHER", "PLUGIN_ID", "REPO", "SAMPLE_END", "STUBBED", "Stubs",
+    "StubbedCase", "bytecode_dirs", "cli_env", "clock", "commit", "day_json", "git", "identity", "init_repo",
+    "isolated_env", "make_sample", "notification", "real_tool", "sample_days", "sample_summary", "stamp",
 ]

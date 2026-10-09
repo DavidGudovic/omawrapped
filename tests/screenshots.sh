@@ -55,6 +55,9 @@ card() {
 card --week --theme "$THEME" -o "$REPO/preview.png"
 card --month --theme "$THEME" -o "$REPO/docs/card-month.png"
 card --week --theme "$LIGHT" -o "$REPO/docs/card-light.png"
+# A card is saved for its owner's eyes only. These are of made-up days and
+# are part of the repository, so they are opened up again.
+chmod 644 "$REPO/preview.png" "$REPO/docs/card-month.png" "$REPO/docs/card-light.png"
 
 for picture in preview.png docs/card-month.png docs/card-light.png docs/bar-widget.png; do
   echo "screenshots: $picture $(/usr/bin/file -b "$REPO/$picture" | cut -d, -f1-2)"

@@ -86,6 +86,8 @@ Item {
 
   property var _state: Tracker.create()
   property bool _ready: false
+  // True once the shell is taking the service down.
+  property bool _closing: false
   // The day file as it was last read or written, to show today's total
   // without reading the disk on every tick.
   property var _stored: null
@@ -180,10 +182,12 @@ Item {
     var today = Tracker.dateKey(_lastFlush)
     var pending = Tracker.takePending(_state)
     var todayRead = false
+    var made = false
     for (var date in pending) {
       var read = readDay(date)
       var merged = read.ok ? Tracker.mergeDay(read.day, pending[date]) : null
       if (merged !== null && writeDay(merged)) {
+        if (read.day === null) made = true
         if (date === today) {
           _stored = merged
           todayRead = true
@@ -196,6 +200,16 @@ Item {
     // the bar follows a reset or a file removed by hand.
     if (!todayRead) _stored = readDay(today).day
     refreshToday()
+    if (made) makePrivate()
+  }
+
+  // The shell writes a new file readable by everyone and keeps the mode of
+  // one it writes again. So a day file is closed to other users once, right
+  // after it was made; until then the folder above it keeps them out.
+  function makePrivate() {
+    // A shell that is closing cannot wait for a program of its own.
+    if (_closing) Quickshell.execDetached({ command: privateCommand, environment: privateEnvironment })
+    else closer.running = true
   }
 
   function tick() {
@@ -251,7 +265,10 @@ Item {
     // What the shell last heard about the lock may be hours old.
     if (pollLock) lockProbe.restart()
   }
-  Component.onDestruction: flush()
+  Component.onDestruction: {
+    _closing = true
+    flush()
+  }
 
   IdleMonitor {
     id: idleMonitor
@@ -260,18 +277,33 @@ Item {
     respectInhibitors: root.countKeptAwake
   }
 
-  // The data folder is private to the user: made if it is missing, and
-  // closed to others if it was there but open. This is the only program the
+  // Makes the data folder and its days folder if they are missing, and
+  // closes them and every day file to other users: 700 and 600. The folder
+  // is named in the program's environment, which only its owner can read,
+  // not in its arguments, which everyone can. This is the only program the
   // service ever runs; the day files are written by the shell itself.
+  readonly property var privateCommand: ["sh", "-c", "umask 077; mkdir -p \"$OW_DIR/days\" && "
+    + "chmod 700 \"$OW_DIR\" \"$OW_DIR/days\"; "
+    + "for f in \"$OW_DIR\"/days/*.json; do [ -f \"$f\" ] && [ ! -L \"$f\" ] && chmod 600 \"$f\"; done; true"]
+  readonly property var privateEnvironment: ({ OW_DIR: root.dataDir })
+
   Process {
     id: prepare
-    command: ["sh", "-c", "mkdir -p \"$1\" && chmod 700 \"$1\"", "sh", root.dataDir]
+    command: root.privateCommand
+    environment: root.privateEnvironment
     onExited: {
       root._ready = true
       // Reads today's file, and writes whatever waited for the folder. If
       // the folder could not be made, the next flush tries again.
       if (root.folderExists()) root.flush()
     }
+  }
+
+  // The same once more, after a day file was made.
+  Process {
+    id: closer
+    command: root.privateCommand
+    environment: root.privateEnvironment
   }
 
   Timer {

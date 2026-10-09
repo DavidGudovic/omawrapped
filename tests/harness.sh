@@ -27,9 +27,11 @@ ln -s -- "$SHELL_DIR/Commons" "$RUN/root/Commons"
 # so a case can read what would have happened instead of it happening.
 #
 # The notifier appends its arguments, one per line, and "==" after each call.
+# Only the widget starts it, and only with one of its two fixed sentences:
+# what the command has to say goes over the session bus, further down.
 cat > "$RUN/bin/omarchy-notification-send" <<'STUB'
 #!/usr/bin/sh
-{ printf '%s\n' "$@"; echo "=="; } >> "$OW_RUN/notification.txt"
+{ printf '%s\n' "$@"; echo "=="; } >> "$OW_RUN/widget-said.txt"
 STUB
 # Omarchy's menu: answers with the line in menu-choice, or is dismissed.
 cat > "$RUN/bin/omarchy-menu-select" <<'STUB'
@@ -49,7 +51,28 @@ done
 printf '#!/usr/bin/sh\nexit 1\n' > "$RUN/bin/omarchy-shell"
 chmod +x "$RUN"/bin/*
 
+# A session bus of this run's own, with a stand-in notification service that
+# writes down what it is sent. Without it the bus address leads nowhere: the
+# real session bus is never within reach.
+BUS_ADDRESS="unix:path=$RUN/no-bus"
+if [ "$CASE" = widget ]; then
+  env -i HOME="$RUN/home" XDG_RUNTIME_DIR="$RUN" PATH=/usr/bin \
+    /usr/bin/python3 -B "$REPO/tests/fake_bus.py" "$RUN/notifications.jsonl" > "$RUN/bus-address" 2> "$RUN/bus.txt" &
+  BUS_PID=$!
+  trap 'kill "$BUS_PID" 2>/dev/null || true; wait "$BUS_PID" 2>/dev/null || true; rm -rf -- "$RUN"' EXIT
+  tries=0
+  until [ -s "$RUN/bus-address" ]; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 100 ] || ! kill -0 "$BUS_PID" 2>/dev/null; then
+      echo "harness: the test bus did not start" >&2; cat "$RUN/bus.txt" >&2; exit 1
+    fi
+    /usr/bin/sleep 0.1
+  done
+  BUS_ADDRESS=$(cat "$RUN/bus-address")
+fi
+
 env -i HOME="$RUN/home" XDG_RUNTIME_DIR="$RUN" XDG_DATA_HOME="$RUN/data" \
+  DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" \
   XDG_CONFIG_HOME="$RUN/config" XDG_CACHE_HOME="$RUN/cache" XDG_STATE_HOME="$RUN/state" \
   PATH="$RUN/bin:/usr/bin" LANG=C.UTF-8 QT_QPA_PLATFORM=offscreen \
   QS_DISABLE_CRASH_HANDLER=1 QS_NO_RELOAD_POPUP=1 QS_DISABLE_FILE_WATCHER=1 \
@@ -72,6 +95,14 @@ if [ "$CASE" = service ] && [ "$verdict" = PASS ]; then
   # has deleted it twice under the running service.
   mode=$(stat -c %a "$RUN/data/omawrapped")
   if [ "$mode" != 700 ]; then echo "harness: data directory mode is $mode, expected 700" >&2; verdict=FAIL; fi
+  # So must what is in it: the days folder, and every day file, which the
+  # shell makes readable by everyone and the service then closes.
+  modes=$(stat -c %a "$RUN/data/omawrapped/days" "$RUN"/data/omawrapped/days/*.json | tr '\n' ' ')
+  if [ "$modes" = "700 600 " ]; then
+    echo "OW-CHECK ok   the days folder and the day file are private = $modes(expected 700 600)"
+  else
+    echo "harness: modes of the days folder and its file are $modes, expected 700 600" >&2; verdict=FAIL
+  fi
   # The case ends with a second it never flushes. The file had about 1300 ms
   # before it (and a second of pause, which adds nothing); the shell closing
   # must have added the rest.
@@ -80,6 +111,20 @@ if [ "$CASE" = service ] && [ "$verdict" = PASS ]; then
     echo "OW-CHECK ok   written when the shell closed = $written (expected about 2300)"
   else
     echo "harness: $written ms on disk after the shell closed, expected about 2300" >&2; verdict=FAIL
+  fi
+fi
+
+if [ "$CASE" = widget ]; then
+  # Every user of a machine can read what a program was started with. The
+  # case has drawn cards and asked for today, from a month of sample days:
+  # no app of those days and no time may be among the arguments of anything
+  # that was started for it.
+  touch "$RUN/widget-said.txt" "$RUN/started.txt" "$RUN/menu-asked.txt"
+  if grep -a -n -E -e '[0-9]+h [0-9][0-9]m' -e '[0-9]+m( |$)' -e 'Ghostty|Chromium|Zed|Slack|Obsidian' \
+      "$RUN/widget-said.txt" "$RUN/started.txt" "$RUN/menu-asked.txt" >&2; then
+    echo "harness: a program was started with what the user did among its arguments" >&2; verdict=FAIL
+  else
+    echo "OW-CHECK ok   no app and no time among the arguments of any program started"
   fi
 fi
 

@@ -9,7 +9,7 @@ from unittest import mock
 
 from omawrapped import gitstats
 from omawrapped.gitstats import GitStats, count_commits, find_repos
-from support import ME, OTHER, IsolatedCase, commit, git, identity, init_repo
+from support import ME, OTHER, IsolatedCase, StubbedCase, commit, git, identity, init_repo
 
 START = datetime(2026, 3, 10, tzinfo=timezone.utc)
 END = datetime(2026, 3, 11, tzinfo=timezone.utc)
@@ -208,7 +208,7 @@ class CountCommitsTests(IsolatedCase):
         self.assertEqual(self.count().commits, 0)
 
     def test_git_is_run_in_each_repository_whatever_the_environment_points_at(self):
-        # GIT_DIR beats `git -C`: left in place, every repository would be read as this one.
+        # GIT_DIR beats the folder git is started in: left in place, every repository would be read as this one.
         decoy = init_repo(self.tmp / "decoy")
         for _ in range(5):
             commit(decoy, NOON)
@@ -239,7 +239,7 @@ class CountCommitsTests(IsolatedCase):
         real = subprocess.run
 
         def slow_in_b(command, **options):
-            if str(self.root / "b") in command:
+            if options["cwd"] == str(self.root / "b"):
                 raise subprocess.TimeoutExpired(command, options.get("timeout"))
             return real(command, **options)
 
@@ -400,6 +400,82 @@ class CountCommitsTests(IsolatedCase):
         self.assertIn("A  staged.txt", before["status"])
         self.assertEqual(self.count().commits, 2)
         self.assertEqual(snapshot(), before)
+
+
+class GitArgumentsTests(StubbedCase):
+    """What git is started with can be read by every user of the machine: no repository is named in it."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp / "repos"
+        self.secret = init_repo(self.root / "secret-client")
+        commit(self.secret, NOON)
+        commit(self.secret, NOON + timedelta(hours=1), email=OTHER)
+        # The repository exists; from here on every start of git is recorded and goes on to the real one.
+        self.stubs.spy("git")
+
+    def calls(self):
+        return self.stubs.argv("git")
+
+    def test_git_is_started_in_the_repository_and_no_argument_names_it(self):
+        self.assertEqual(count_commits([self.root], START, END), GitStats(commits=1, repos=1, scanned=1))
+        self.assertGreaterEqual(len(self.calls()), 2)
+        self.assertEqual(self.stubs.cwds("git"), [str(self.secret)] * len(self.calls()))
+        for arguments in self.calls():
+            for argument in arguments:
+                self.assertNotIn("secret-client", argument)
+                self.assertNotIn(str(self.tmp), argument)
+            self.assertNotIn("-C", arguments)
+            self.assertEqual(arguments[0], "--no-pager")
+
+    def test_what_git_is_asked_is_the_same_as_before(self):
+        count_commits([self.root], START, END)
+        self.assertEqual(self.calls()[0], ["--no-pager", "config", "--get", "user.email"])
+        self.assertEqual(self.calls()[1][:6], ["--no-pager", "log", "--branches", "--remotes", "HEAD", "--no-merges"])
+
+    def test_each_repository_gets_git_started_in_its_own_folder(self):
+        other = init_repo(self.root / "group" / "other-client")
+        commit(other, NOON)
+        self.stubs.logs.joinpath("git.log").unlink(missing_ok=True)
+        self.stubs.logs.joinpath("git.cwd").unlink(missing_ok=True)
+        self.assertEqual(count_commits([self.root], START, END).scanned, 2)
+        self.assertEqual(set(self.stubs.cwds("git")), {str(self.secret), str(other.resolve())})
+        for arguments in self.calls():
+            self.assertFalse([argument for argument in arguments if "client" in argument], arguments)
+
+    def test_a_folder_that_vanished_gives_none_not_a_traceback(self):
+        gone = self.tmp / "gone"
+        self.assertIsNone(gitstats._git(gone, "config", "--get", "user.email"))
+        self.assertEqual(self.calls(), [])
+
+    def test_a_repository_that_vanishes_after_it_was_found_adds_nothing_and_fails_nothing(self):
+        with mock.patch.object(gitstats, "_walk", return_value=([self.tmp / "gone", self.secret], True)):
+            stats = count_commits([self.root], START, END)
+        self.assertEqual(stats, GitStats(commits=1, repos=1, scanned=2))
+
+    def test_a_folder_that_is_no_repository_gives_none(self):
+        elsewhere = self.tmp / "plain"
+        elsewhere.mkdir()
+        self.assertIsNone(gitstats._git(elsewhere, "rev-parse", "HEAD"))
+
+    def test_a_hanging_git_still_raises_for_the_caller_to_mark_the_count(self):
+        timed_out = subprocess.TimeoutExpired("git", 15)
+        with mock.patch.object(gitstats.subprocess, "run", side_effect=timed_out):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                gitstats._git(self.secret, "log")
+
+    def test_git_is_started_with_the_environment_it_was_before(self):
+        run = mock.patch.object(gitstats.subprocess, "run", wraps=subprocess.run)
+        with run as spied:
+            gitstats._git(self.secret, "config", "--get", "user.email")
+        options = spied.call_args.kwargs
+        self.assertEqual(spied.call_args.args[0], ["git", "--no-pager", "config", "--get", "user.email"])
+        self.assertEqual((options["cwd"], options["timeout"], options["stdin"]),
+                         (str(self.secret), gitstats.TIMEOUT, subprocess.DEVNULL))
+        for name, value in gitstats.ENV.items():
+            self.assertEqual(options["env"][name], value)
+        for name in gitstats.REDIRECTS:
+            self.assertNotIn(name, options["env"])
 
 
 if __name__ == "__main__":

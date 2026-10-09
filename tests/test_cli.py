@@ -1,11 +1,14 @@
 import support  # noqa: F401  (must stay first: it disables bytecode and isolates the environment)
 
+import contextlib
+import io
 import json
 import os
 import pty
 import random
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import time
@@ -14,14 +17,14 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from datetime import time as time_of_day
 from pathlib import Path
+from unittest import mock
 
-from omawrapped import VERSION, aggregate
-from support import (LAUNCHER, OTHER, PLUGIN_ID, STUBBED, IsolatedCase, Stubs, bytecode_dirs, cli_env, clock,
-                     commit, init_repo, make_sample, real_tool)
+from omawrapped import VERSION, aggregate, cli, share, system
+from support import (GLYPH, LAUNCHER, ME, OTHER, PLUGIN_ID, STUBBED, IsolatedCase, StubbedCase, Stubs, bytecode_dirs,
+                     cli_env, clock, commit, init_repo, isolated_env, make_sample, notification, real_tool)
 
 SVG = "{http://www.w3.org/2000/svg}"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-GLYPH = "\U000f154d"
 NO_CARD = "There is no card yet. Draw one with `omawrapped card`, or click the widget."
 COPY_FAILED = "wl-copy could not copy the card. Is a Wayland session running?"
 NO_WL_COPY = "wl-copy was not found (package wl-clipboard), so nothing was copied."
@@ -64,6 +67,39 @@ def svg_texts(path: Path) -> list:
     return ["".join(element.itertext()) for element in ET.parse(path).getroot().iter(SVG + "text")]
 
 
+def mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+# A time the way the card and the CLI write it: 3h 07m, 52m.
+DURATION = re.compile(r"\b\d+h \d\dm\b|\b\d+m\b")
+
+
+def leaks(started: dict, private: list, root: Path, cards=()) -> list:
+    """(program, argument, why) for every argument that gives away what the user did, or where they keep it.
+
+    started is {program: the arguments of each of its calls}, as Stubs.everything() has it. An argument is a leak
+    when it holds a time, or one of the private words in any case, or is a path below root (the fake machine) that
+    is not the path of a card in `cards` handed to xdg-open or nautilus. Nautilus is started through uwsm-app, which
+    is looked through.
+    """
+    found = []
+    for started_program, calls in started.items():
+        for arguments in calls:
+            program = started_program
+            if program == "uwsm-app" and arguments[:2] == ["--", "nautilus"]:
+                program, arguments = "nautilus", arguments[2:]
+            for argument in arguments:
+                if argument.startswith(str(root)):
+                    if argument not in cards or program not in ("xdg-open", "nautilus"):
+                        found.append((program, argument, "a path"))
+                    continue
+                if DURATION.search(argument):
+                    found.append((program, argument, "a time"))
+                found.extend((program, argument, word) for word in private if word.lower() in argument.lower())
+    return found
+
+
 class CliCase(IsolatedCase):
     """Runs bin/omawrapped as a subprocess in a fake machine, with stand-ins for the programs it starts."""
 
@@ -74,6 +110,7 @@ class CliCase(IsolatedCase):
         self.work = self.tmp / "work"
         self.work.mkdir()
         self.addCleanup(self.assert_no_bytecode)
+        self.addCleanup(self.assert_no_notification_program_started)
 
     def sampler_reply(self, **fields) -> str:
         """What a running sampler answers to `status`. By default it records to this test's data folder."""
@@ -91,6 +128,11 @@ class CliCase(IsolatedCase):
         fields of sampler(), or None when nothing answers."""
         self.stubs.reply_to_status_in_turn(*["" if reply is None else self.sampler_reply(**reply) for reply in replies])
 
+    def assert_no_notification_program_started(self):
+        """After every test: a notification goes over the session bus, so neither program for it was started."""
+        for name in ("omarchy-notification-send", "notify-send"):
+            self.assertEqual(self.stubs.argv(name), [], "%s was started" % name)
+
     def assert_no_bytecode(self):
         self.assertEqual(bytecode_dirs(), [], "the launcher must not leave bytecode in the plugin folder")
 
@@ -99,10 +141,11 @@ class CliCase(IsolatedCase):
         env.update(extra)
         return env
 
-    def run_cli(self, *args, stdin=subprocess.DEVNULL, cwd=None, launcher=LAUNCHER, **extra_env):
+    def run_cli(self, *args, stdin=subprocess.DEVNULL, cwd=None, launcher=LAUNCHER, umask=None, **extra_env):
         return subprocess.run(
             [str(launcher), *map(str, args)], capture_output=True, text=True, stdin=stdin,
             env=self.environment(**extra_env), cwd=str(cwd or self.work), timeout=60,
+            umask=-1 if umask is None else umask,
         )
 
     def ok(self, *args, **kwargs):
@@ -146,21 +189,22 @@ class CliCase(IsolatedCase):
         os.utime(path, (mtime, mtime))
         return path
 
-    def notification(self, headline, body, image=None, click=None) -> list:
-        """The arguments omarchy-notification-send is to get: the spec's order, with --exec and its command last."""
-        argv = ["--app-name", "OmaWrapped", "-g", GLYPH]
-        if image:
-            argv += ["--image", str(image)]
-        argv += [headline, body]
-        if click:
-            argv += ["--exec", *map(str, click)]
-        return argv
+    def sent(self) -> list:
+        """What the test bus was sent so far. Only for a case with needs_bus."""
+        return self.bus.notifications()
 
     def assert_nothing_started(self, *names):
-        """None of the desktop programs (except the named ones) was started."""
+        """None of the desktop programs (except the named ones) was started. The two that used to send a
+        notification are never started: a notification is sent over the session bus."""
         for name in STUBBED:
             if name not in names:
                 self.assertEqual(self.stubs.argv(name), [], "%s was started" % name)
+
+    def without_python_gobject(self) -> dict:
+        """The variable that makes `import gi` fail in a run, as on a machine without python-gobject."""
+        folder = self.tmp / "no-gobject"
+        self.write(folder / "gi" / "__init__.py", "raise ImportError('No module named gi')\n")
+        return {"PYTHONPATH": str(folder)}
 
     def repo_with_commits(self, folder: Path) -> Path:
         """A repository whose commits fall inside, on the edge of and outside the last week. Oldest first."""
@@ -171,6 +215,15 @@ class CliCase(IsolatedCase):
         commit(repo, self.local(self.today - timedelta(days=1)))
         commit(repo, self.local(self.today - timedelta(days=1), time_of_day(13)), email=OTHER)
         return repo
+
+
+class OnTheBus:
+    """For a test case with needs_bus whose runs all have the test bus, unless a test names another address."""
+
+    needs_bus = True
+
+    def run_cli(self, *args, **kwargs):
+        return super().run_cli(*args, **{**self.on_bus, **kwargs})
 
 
 class LauncherTests(CliCase):
@@ -212,6 +265,16 @@ class LauncherTests(CliCase):
             self.assertIn("--notify", self.ok(command, "--help").stdout)
         self.assertNotIn("--notify", self.ok("show", "--help").stdout)
         self.assertNotIn("--notify", self.ok("menu", "--help").stdout)
+
+    def test_the_notify_options_say_that_a_failure_is_said_too(self):
+        said = {"card": "say on the desktop that the card is ready, or why it is not",
+                "copy": "say on the desktop that the card is on the clipboard, or why it is not",
+                "pause": "say on the desktop that counting is paused, or why it is not",
+                "resume": "say on the desktop that counting is back, or why it is not",
+                "today": "say it on the desktop too"}
+        for command, words in said.items():
+            with self.subTest(command=command):
+                self.assertIn(words, " ".join(self.ok(command, "--help").stdout.split()))
 
     def test_an_unknown_command_is_an_argument_error(self):
         result = self.run_cli("frobnicate")
@@ -822,13 +885,15 @@ class CardTests(CliCase):
         self.record()
         output = self.tmp / "c.svg"
         self.ok("card", "-o", output)
-        self.assertEqual(self.stubs.calls("wl-copy"), ["-- " + str(output)])
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "text/plain"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), str(output).encode())
 
-    def test_copy_path_asks_for_the_path(self):
+    def test_copy_path_gives_it_the_path_on_its_standard_input(self):
         self.record()
         output = self.tmp / "c.svg"
         result = self.ok("card", "-o", output, "--copy", "path")
-        self.assertEqual(self.stubs.calls("wl-copy"), ["-- " + str(output)])
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "text/plain"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), str(output).encode())
         self.assertIn("(path copied)", result.stderr)
 
     def test_copy_none_runs_no_wl_copy(self):
@@ -897,7 +962,8 @@ class CardTests(CliCase):
         self.assertEqual(data[:8], PNG_SIGNATURE)
         self.assertEqual(struct.unpack(">II", data[16:24]), (1600, 900))
         self.assertEqual(os.listdir(self.pictures), [expected.name])
-        self.assertEqual(self.stubs.calls("wl-copy"), ["-- " + str(expected)])
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "text/plain"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), str(expected).encode())
 
     @needs_renderer
     def test_the_month_card_is_named_with_a_month_suffix(self):
@@ -938,11 +1004,8 @@ class CardTests(CliCase):
         self.assertEqual(output.read_bytes()[:8], PNG_SIGNATURE)
 
 
-class CardNotifyTests(CliCase):
+class CardNotifyTests(OnTheBus, CliCase):
     """card --notify: the desktop is told, in one of three ways, what became of the card."""
-
-    def sent(self) -> list:
-        return self.stubs.argv("omarchy-notification-send")
 
     def click(self, path) -> list:
         return [str(LAUNCHER), "show", str(path)]
@@ -954,7 +1017,7 @@ class CardNotifyTests(CliCase):
         result = self.ok("card", "-o", output, "--copy", "image", "--notify")
         self.assertEqual(result.stdout, str(output) + "\n")
         self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/png"]])
-        self.assertEqual(self.sent(), [self.notification(
+        self.assertEqual(self.sent(), [notification(
             "Card copied", "Paste it into a post. " + CLICK_HINT, image=output, click=self.click(output))])
 
     @needs_renderer
@@ -962,8 +1025,9 @@ class CardNotifyTests(CliCase):
         self.record()
         output = self.tmp / "c.png"
         self.ok("card", "-o", output, "--notify")
-        self.assertEqual(self.stubs.argv("wl-copy"), [["--", str(output)]])
-        self.assertEqual(self.sent(), [self.notification(
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "text/plain"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), str(output).encode())
+        self.assertEqual(self.sent(), [notification(
             "Card saved", "Its path is on the clipboard. " + CLICK_HINT, image=output, click=self.click(output))])
 
     @needs_renderer
@@ -972,7 +1036,7 @@ class CardNotifyTests(CliCase):
         output = self.tmp / "c.png"
         self.ok("card", "-o", output, "--copy", "none", "--notify")
         self.assertEqual(self.stubs.argv("wl-copy"), [])
-        self.assertEqual(self.sent(), [self.notification(
+        self.assertEqual(self.sent(), [notification(
             "Card saved", "%s. %s" % (output, CLICK_HINT), image=output, click=self.click(output))])
 
     @needs_renderer
@@ -981,7 +1045,7 @@ class CardNotifyTests(CliCase):
         result = self.ok("card", "--copy", "image", "--notify")
         expected = self.pictures / ("omawrapped-%s.png" % self.today.isoformat())
         self.assertEqual(result.stdout, str(expected) + "\n")
-        self.assertEqual(self.sent(), [self.notification(
+        self.assertEqual(self.sent(), [notification(
             "Card copied", "Paste it into a post. " + CLICK_HINT, image=expected, click=self.click(expected))])
 
     @needs_renderer
@@ -989,14 +1053,15 @@ class CardNotifyTests(CliCase):
         self.record()
         output = self.tmp / "mine.PNG"
         self.ok("card", "-o", output, "--copy", "none", "--notify")
-        self.assertEqual(self.sent()[0][4:6], ["--image", str(output)])
+        self.assertEqual(self.sent()[0]["hints"]["image-path"], str(output))
 
     def test_the_image_of_an_svg_is_not_passed_on(self):
         self.record()
         output = self.tmp / "c.svg"
         self.ok("card", "-o", output, "--copy", "image", "--notify")
-        self.assertEqual(self.sent(), [self.notification(
+        self.assertEqual(self.sent(), [notification(
             "Card copied", "Paste it into a post. " + CLICK_HINT, click=self.click(output))])
+        self.assertNotIn("image-path", self.sent()[0]["hints"])
 
     def test_a_click_runs_this_command_by_its_absolute_path(self):
         self.record()
@@ -1005,7 +1070,7 @@ class CardNotifyTests(CliCase):
         output = self.tmp / "c.svg"
         # Even when the command was started through a link that will be gone, the click must find it.
         self.ok("card", "-o", output, "--copy", "none", "--notify", launcher=link)
-        command = self.sent()[0][self.sent()[0].index("--exec") + 1:]
+        command = json.loads(self.sent()[0]["hints"]["omarchy-exec-argv"])
         self.assertEqual(command, [str(LAUNCHER), "show", str(output)])
         self.assertTrue(os.path.isabs(command[0]) and os.access(command[0], os.X_OK))
 
@@ -1013,7 +1078,7 @@ class CardNotifyTests(CliCase):
         self.record()
         self.ok("card", "-o", "c.svg", "--copy", "none", "--notify", cwd=self.work)
         output = self.work / "c.svg"
-        self.assertEqual(self.sent(), [self.notification(
+        self.assertEqual(self.sent(), [notification(
             "Card saved", "%s. %s" % (output, CLICK_HINT), click=self.click(output))])
 
     def test_without_notify_nothing_is_said(self):
@@ -1021,7 +1086,7 @@ class CardNotifyTests(CliCase):
         for copy in ("path", "image", "none"):
             self.ok("card", "-o", self.tmp / "c.svg", "--copy", copy)
         self.assertEqual(self.sent(), [])
-        self.assertEqual(self.stubs.argv("notify-send"), [])
+        self.assert_nothing_started("wl-copy", "omarchy-shell")
 
     def test_a_copy_that_failed_is_reported_and_the_card_is_called_saved(self):
         self.record()
@@ -1029,11 +1094,13 @@ class CardNotifyTests(CliCase):
         output = self.tmp / "c.svg"
         for what in ("path", "image"):
             with self.subTest(copy=what):
+                self.bus.clear()
                 result = self.ok("card", "-o", output, "--copy", what, "--notify")
                 self.assertEqual(result.stderr, COPY_FAILED + "\nSaved %s\n" % output)
                 self.assertEqual(result.stdout, str(output) + "\n")
-                self.assertEqual(self.sent()[-1], self.notification(
-                    "Card saved", "%s. %s" % (output, CLICK_HINT), click=self.click(output)))
+                # A warning is not a failure: the desktop is told about the card, and that is all it is told.
+                self.assertEqual(self.sent(), [notification(
+                    "Card saved", "%s. %s" % (output, CLICK_HINT), click=self.click(output))])
 
     def test_a_missing_wl_copy_is_reported_and_the_card_is_called_saved(self):
         self.record()
@@ -1041,41 +1108,47 @@ class CardNotifyTests(CliCase):
         output = self.tmp / "c.svg"
         result = self.ok("card", "-o", output, "--notify")
         self.assertEqual(result.stderr, NO_WL_COPY + "\nSaved %s\n" % output)
-        self.assertEqual(self.sent(), [self.notification(
+        self.assertEqual(self.sent(), [notification(
             "Card saved", "%s. %s" % (output, CLICK_HINT), click=self.click(output))])
 
-    def test_notify_send_is_the_fallback(self):
+    def test_no_program_is_started_to_say_it_and_none_is_needed(self):
+        # Omarchy's notification tool and notify-send would be given the text as arguments, where everybody can
+        # read it. They are not started, and a machine without them gets the notification all the same.
         self.record()
-        self.stubs.remove("omarchy-notification-send")
         output = self.tmp / "c.svg"
         self.ok("card", "-o", output, "--copy", "image", "--notify")
-        self.assertEqual(self.stubs.argv("notify-send"), [
-            ["-a", "OmaWrapped", "Card copied", "Paste it into a post. " + CLICK_HINT]])
-
-    @needs_renderer
-    def test_notify_send_gets_the_image(self):
-        self.record()
-        self.stubs.remove("omarchy-notification-send")
-        output = self.tmp / "c.png"
-        self.ok("card", "-o", output, "--copy", "image", "--notify")
-        self.assertEqual(self.stubs.argv("notify-send"), [
-            ["-a", "OmaWrapped", "-i", str(output), "Card copied", "Paste it into a post. " + CLICK_HINT]])
-
-    def test_without_any_notification_tool_the_card_is_still_made_and_nothing_is_said_about_it(self):
-        self.record()
+        self.assertEqual(len(self.sent()), 1)
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+        self.assertEqual(self.stubs.argv("notify-send"), [])
         self.stubs.remove("omarchy-notification-send", "notify-send")
-        output = self.tmp / "c.svg"
-        result = self.ok("card", "-o", output, "--copy", "none", "--notify")
-        self.assertEqual(result.stdout, str(output) + "\n")
-        self.assertEqual(result.stderr, "Saved %s\n" % output)
+        self.ok("card", "-o", output, "--copy", "image", "--notify")
+        self.assertEqual(len(self.sent()), 2)
 
-    def test_a_notification_that_fails_does_not_fail_the_card(self):
+    def test_without_a_bus_the_card_is_still_made_and_nothing_is_said_about_it(self):
         self.record()
-        self.stubs.fail("omarchy-notification-send")
+        output = self.tmp / "c.svg"
+        for name, address in (("none named", ""), ("a dead one", isolated_env(self.tmp)["DBUS_SESSION_BUS_ADDRESS"])):
+            with self.subTest(bus=name):
+                result = self.ok("card", "-o", output, "--copy", "none", "--notify", DBUS_SESSION_BUS_ADDRESS=address)
+                self.assertEqual(result.stdout, str(output) + "\n")
+                self.assertEqual(result.stderr, "Saved %s\n" % output)
+        self.assertEqual(self.sent(), [])
+
+    def test_without_python_gobject_the_card_is_still_made_and_nothing_is_said_about_it(self):
+        self.record()
+        output = self.tmp / "c.svg"
+        result = self.ok("card", "-o", output, "--copy", "none", "--notify", **self.without_python_gobject())
+        self.assertEqual((result.stdout, result.stderr), (str(output) + "\n", "Saved %s\n" % output))
+        self.assertEqual(self.sent(), [])
+
+    def test_a_service_that_refuses_does_not_fail_the_card(self):
+        self.record()
+        self.bus.refuse(True)
         output = self.tmp / "c.svg"
         result = self.ok("card", "-o", output, "--copy", "none", "--notify")
         self.assertEqual(result.stdout, str(output) + "\n")
         self.assertEqual(result.stderr, "Saved %s\n" % output)
+        self.assertEqual(self.sent(), [])
 
     def test_open_and_notify_together(self):
         self.record()
@@ -1084,14 +1157,10 @@ class CardNotifyTests(CliCase):
         self.assertEqual(self.stubs.wait_for_argv("xdg-open"), [[str(output)]])
         self.assertEqual(len(self.sent()), 1)
 
-    def test_no_card_no_notification(self):
-        result = self.run_cli("card", "-o", self.tmp / "c.svg", "--notify")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("Nothing was recorded", result.stderr)
-        self.assert_nothing_started("omarchy-shell")
-
 
 class CopyCommandTests(CliCase):
+    needs_bus = True
+
     def test_without_a_file_the_newest_card_in_the_pictures_folder_is_copied(self):
         self.make_card("omawrapped-2026-10-09.png", mtime=1000)
         newest = self.make_card("omawrapped-2026-10-02.png", mtime=3000)
@@ -1187,40 +1256,51 @@ class CopyCommandTests(CliCase):
 
     def test_notify_says_that_the_card_is_on_the_clipboard(self):
         card = self.make_card("omawrapped-2026-10-02.png")
-        result = self.ok("copy", "--notify")
+        result = self.ok("copy", "--notify", **self.on_bus)
         self.assertEqual(result.stdout, str(card) + "\n")
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(
+        self.assertEqual(self.sent(), [notification(
             "Card copied", "omawrapped-2026-10-02.png is on the clipboard. Paste it anywhere.", image=card)])
 
     def test_notify_names_the_file_that_was_copied(self):
         file = self.write(self.work / "mine.png", "x")
-        self.ok("copy", file, "--notify")
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(
+        self.ok("copy", file, "--notify", **self.on_bus)
+        self.assertEqual(self.sent(), [notification(
             "Card copied", "mine.png is on the clipboard. Paste it anywhere.", image=file)])
 
-    def test_notify_falls_back_to_notify_send(self):
-        card = self.make_card()
-        self.stubs.remove("omarchy-notification-send")
-        self.ok("copy", "--notify")
-        body = "%s is on the clipboard. Paste it anywhere." % card.name
-        self.assertEqual(self.stubs.argv("notify-send"), [["-a", "OmaWrapped", "-i", str(card), "Card copied", body]])
+    def test_notify_starts_no_program_to_say_it(self):
+        self.make_card()
+        self.ok("copy", "--notify", **self.on_bus)
+        self.assertEqual(len(self.sent()), 1)
+        self.assert_nothing_started("wl-copy")
 
-    def test_notify_without_a_notification_tool_changes_nothing(self):
+    def test_notify_without_a_bus_changes_nothing(self):
         card = self.make_card()
-        self.stubs.remove("omarchy-notification-send", "notify-send")
-        result = self.ok("copy", "--notify")
-        self.assertEqual(result.stdout, str(card) + "\n")
-        self.assertEqual(result.stderr, "Copied %s (image)\n" % card)
+        for address in ("", isolated_env(self.tmp)["DBUS_SESSION_BUS_ADDRESS"]):
+            with self.subTest(address=address):
+                result = self.ok("copy", "--notify", DBUS_SESSION_BUS_ADDRESS=address)
+                self.assertEqual(result.stdout, str(card) + "\n")
+                self.assertEqual(result.stderr, "Copied %s (image)\n" % card)
+        self.assertEqual(self.sent(), [])
+
+    def test_a_service_that_refuses_changes_nothing(self):
+        card = self.make_card()
+        self.bus.refuse(True)
+        result = self.ok("copy", "--notify", **self.on_bus)
+        self.assertEqual((result.stdout, result.stderr), (str(card) + "\n", "Copied %s (image)\n" % card))
 
     def test_without_notify_nothing_is_said(self):
         self.make_card()
-        self.ok("copy")
+        self.ok("copy", **self.on_bus)
+        self.assertEqual(self.sent(), [])
         self.assert_nothing_started("wl-copy")
 
-    def test_nothing_is_said_when_the_copy_failed(self):
+    def test_a_copy_that_failed_is_said_on_the_desktop_and_not_announced_as_done(self):
         self.make_card()
         self.stubs.fail("wl-copy")
         self.assertEqual(self.run_cli("copy", "--notify").returncode, 1)
+        result = self.run_cli("copy", "--notify", **self.on_bus)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", COPY_FAILED + "\n"))
+        self.assertEqual(self.sent(), [notification("OmaWrapped", COPY_FAILED)])
         self.assert_nothing_started("wl-copy")
 
     def test_the_sampler_is_not_involved(self):
@@ -1295,6 +1375,8 @@ class ShowCommandTests(CliCase):
 
 
 class TodayTests(CliCase):
+    needs_bus = True
+
     def test_lists_the_time_and_the_top_five_apps_most_time_first(self):
         self.busy_day()
         result = self.ok("today")
@@ -1391,62 +1473,59 @@ class TodayTests(CliCase):
         self.write(self.config / "omarchy" / "shell.json", json.dumps(
             {"version": 1, "bar": {"layout": {"right": [{"id": PLUGIN_ID, "repoDirs": str(repos)}]}}}))
         self.ok("today")
-        self.ok("today", "--notify")
+        self.ok("today", "--notify", **self.on_bus)
         self.assertEqual(self.stubs.argv("git"), [])
 
     def test_it_writes_nothing(self):
-        self.ok("today", "--notify")
+        self.ok("today", "--notify", **self.on_bus)
         self.assertFalse((self.data_home / "omawrapped").exists())
         self.assertFalse(self.pictures.exists())
-        self.assert_nothing_started("omarchy-shell", "omarchy-notification-send")
+        self.assert_nothing_started("omarchy-shell")
 
 
-class TodayNotifyTests(CliCase):
-    def sent(self, *args) -> list:
-        """What omarchy-notification-send was given by `today --notify`."""
+class TodayNotifyTests(OnTheBus, CliCase):
+    def say(self, *args) -> list:
+        """What the bus was sent by `today --notify`, so far."""
         self.ok("today", "--notify", *args)
-        return self.stubs.argv("omarchy-notification-send")
+        return self.sent()
 
     def test_the_headline_is_the_time_and_the_body_the_top_three_apps(self):
         self.busy_day()
-        self.assertEqual(self.sent(), [self.notification("Today: 3h 07m", TODAY_BODY)])
+        self.assertEqual(self.say(), [notification("Today: 3h 07m", TODAY_BODY)])
 
     def test_there_is_no_image_and_no_click_command(self):
         self.busy_day()
-        argv = self.sent()[0]
-        self.assertEqual(argv, ["--app-name", "OmaWrapped", "-g", GLYPH, "Today: 3h 07m", TODAY_BODY])
-        self.assertNotIn("--image", argv)
-        self.assertNotIn("--exec", argv)
+        self.assertEqual(self.say()[0]["hints"], {"urgency": 0, "omarchy-glyph": GLYPH})
 
     def test_fewer_than_three_apps(self):
         self.write_day(self.today, active_ms=5400000, apps_ms={"zed": 1800000, "com.mitchellh.ghostty": 3600000})
-        self.assertEqual(self.sent(), [self.notification("Today: 1h 30m", "Ghostty 1h 00m · Zed 30m")])
+        self.assertEqual(self.say(), [notification("Today: 1h 30m", "Ghostty 1h 00m · Zed 30m")])
         self.write_day(self.today, active_ms=3600000, apps_ms={"zed": 3600000})
-        self.assertEqual(self.sent()[1:], [self.notification("Today: 1h 00m", "Zed 1h 00m")])
+        self.assertEqual(self.say()[1:], [notification("Today: 1h 00m", "Zed 1h 00m")])
 
     def test_nothing_counted_yet_has_an_empty_body(self):
-        self.assertEqual(self.sent(), [self.notification("Today: nothing counted yet", "")])
+        self.assertEqual(self.say(), [notification("Today: nothing counted yet", "")])
 
     def test_less_than_a_minute_has_no_apps_either(self):
         self.write_day(self.today, active_ms=59999, apps_ms={"slack": 59999})
-        self.assertEqual(self.sent(), [self.notification("Today: nothing counted yet", "")])
+        self.assertEqual(self.say(), [notification("Today: nothing counted yet", "")])
 
     def test_a_paused_sampler_is_added_to_the_body(self):
         self.busy_day()
         self.sampler(paused=True)
-        self.assertEqual(self.sent(), [self.notification("Today: 3h 07m", TODAY_BODY + " · counting is paused")])
+        self.assertEqual(self.say(), [notification("Today: 3h 07m", TODAY_BODY + " · counting is paused")])
 
     def test_a_paused_sampler_without_apps_has_only_that_for_a_body(self):
         self.sampler(paused=True)
-        self.assertEqual(self.sent(), [self.notification("Today: nothing counted yet", "Counting is paused.")])
+        self.assertEqual(self.say(), [notification("Today: nothing counted yet", "Counting is paused.")])
 
     def test_time_in_ignored_apps_alone_is_time_without_apps(self):
         self.write_day(self.today, active_ms=3600000, apps_ms={"slack": 3600000})
         self.write(self.config / "omarchy" / "shell.json", json.dumps(
             {"version": 1, "bar": {"layout": {"right": [{"id": PLUGIN_ID, "ignoreApps": "slack"}]}}}))
-        self.assertEqual(self.sent(), [self.notification("Today: 1h 00m", "")])
+        self.assertEqual(self.say(), [notification("Today: 1h 00m", "")])
         self.sampler(paused=True)
-        self.assertEqual(self.sent()[1:], [self.notification("Today: 1h 00m", "Counting is paused.")])
+        self.assertEqual(self.say()[1:], [notification("Today: 1h 00m", "Counting is paused.")])
 
     def test_the_output_is_printed_as_well(self):
         self.busy_day()
@@ -1455,21 +1534,20 @@ class TodayNotifyTests(CliCase):
     def test_without_notify_nothing_is_said(self):
         self.busy_day()
         self.ok("today")
+        self.assertEqual(self.sent(), [])
         self.assert_nothing_started("omarchy-shell")
 
-    def test_notify_send_is_the_fallback(self):
+    def test_no_program_is_started_to_say_it_and_none_is_needed(self):
         self.busy_day()
-        self.stubs.remove("omarchy-notification-send")
         self.ok("today", "--notify")
-        self.assertEqual(self.stubs.argv("notify-send"), [["-a", "OmaWrapped", "Today: 3h 07m", TODAY_BODY]])
-
-    def test_a_desktop_without_notifications_or_with_a_broken_one_is_not_an_error(self):
-        self.busy_day()
-        self.stubs.fail("omarchy-notification-send")
-        result = self.ok("today", "--notify")
-        self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+        self.assertEqual(self.stubs.argv("notify-send"), [])
         self.stubs.remove("omarchy-notification-send", "notify-send")
-        self.assertEqual(self.ok("today", "--notify").stdout.splitlines(), [TODAY] + TODAY_ROWS)
+        self.assertEqual(self.say()[1:], [notification("Today: 3h 07m", TODAY_BODY)])
+
+    def test_the_success_is_the_exit_status_0(self):
+        self.busy_day()
+        self.assertEqual(self.run_cli("today", "--notify").returncode, 0)
 
 
 class PausingTests:
@@ -1484,6 +1562,7 @@ class PausingTests:
     confirmed = None     # what it prints when the sampler has followed
     announced = None     # (headline, body) of the notification then
     not_running = None   # what it prints when there is no sampler to follow
+    needs_bus = True
 
     BAR = ["set", PLUGIN_ID, "paused", None, "--json"]
 
@@ -1573,19 +1652,54 @@ class PausingTests:
 
     def test_notify_says_it_when_the_sampler_has_followed(self):
         self.following()
-        result = self.run_it("--notify")
+        result = self.run_it("--notify", **self.on_bus)
         self.assertEqual((result.returncode, result.stdout), (0, self.confirmed + "\n"))
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(*self.announced)])
+        self.assertEqual(self.sent(), [notification(*self.announced)])
+        self.assert_nothing_started("omarchy-shell", "omarchy-bar")
 
-    def test_notify_is_silent_when_the_sampler_has_not_followed_or_is_not_there(self):
+    def test_notify_does_not_announce_when_the_sampler_has_not_followed_or_is_not_there(self):
+        # Not followed: the command failed, and says so on the desktop instead (see below). Not there: it saved
+        # the setting and has nothing to announce.
         self.not_following()
-        self.assertEqual(self.run_it("--notify").returncode, 1)
+        self.assertEqual(self.run_it("--notify", **self.on_bus).returncode, 3)
+        self.assertEqual(self.sent(), [notification("OmaWrapped", NOT_FOLLOWED.strip())])
+        self.bus.clear()
         self.stubs.reply.unlink()
-        self.assertEqual(self.run_it("--notify").returncode, 0)
+        self.assertEqual(self.run_it("--notify", **self.on_bus).returncode, 0)
+        self.assertEqual(self.sent(), [])
+
+    def test_a_sampler_that_is_not_the_one_for_this_folder_is_a_failure_said_on_the_desktop(self):
         self.sampler(paused=self.paused, dataDir="/somewhere/else/omawrapped")
-        self.assertEqual(self.run_it("--notify").returncode, 1)
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
-        self.assertEqual(self.stubs.argv("notify-send"), [])
+        result = self.run_it("--notify", **self.on_bus)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", NOT_FOLLOWED))
+        self.assertEqual(self.sent(), [notification("OmaWrapped", NOT_FOLLOWED.strip())])
+
+    def test_omarchy_refusing_is_said_on_the_desktop_with_notify_and_only_then(self):
+        self.following()
+        self.stubs.fail("omarchy-bar", 3, reason="Unknown widget: %s\nTry `omarchy plugin list`." % PLUGIN_ID)
+        said = "Omarchy did not accept the change: Unknown widget: %s. Is the widget enabled?" % PLUGIN_ID
+        result = self.run_it(**self.on_bus)
+        self.assertEqual((result.returncode, result.stderr), (1, said + "\n"))
+        self.assertEqual(self.sent(), [])
+        result = self.run_it("--notify", **self.on_bus)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", said + "\n"))
+        self.assertEqual(self.sent(), [notification("OmaWrapped", said)])
+
+    def test_a_missing_omarchy_bar_is_said_on_the_desktop_with_notify(self):
+        self.following()
+        self.stubs.remove("omarchy-bar")
+        said = "omarchy-bar was not found, so the pause could not be %s. It is part of Omarchy 4." % (
+            "saved" if self.word == "true" else "lifted")
+        result = self.run_it("--notify", **self.on_bus)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", said + "\n"))
+        self.assertEqual(self.sent(), [notification("OmaWrapped", said)])
+
+    def test_a_service_that_refuses_a_failure_leaves_the_exit_status_alone(self):
+        self.following()
+        self.stubs.remove("omarchy-bar")
+        self.bus.refuse(True)
+        self.assertEqual(self.run_it("--notify", **self.on_bus).returncode, 1)
+        self.assertEqual(self.sent(), [])
 
     def test_without_notify_nothing_is_said(self):
         self.following()
@@ -1594,9 +1708,14 @@ class PausingTests:
 
     def test_a_desktop_without_notifications_is_not_an_error(self):
         self.following()
-        self.stubs.remove("omarchy-notification-send", "notify-send")
-        result = self.run_it("--notify")
+        for name, address in (("none named", ""), ("a dead one", isolated_env(self.tmp)["DBUS_SESSION_BUS_ADDRESS"])):
+            with self.subTest(bus=name):
+                result = self.run_it("--notify", DBUS_SESSION_BUS_ADDRESS=address)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, self.confirmed + "\n", ""))
+        self.bus.refuse(True)
+        result = self.run_it("--notify", **self.on_bus)
         self.assertEqual((result.returncode, result.stdout), (0, self.confirmed + "\n"))
+        self.assertEqual(self.sent(), [])
 
     def test_without_omarchy_bar_it_says_so(self):
         self.following()
@@ -1693,6 +1812,8 @@ class ResumeTests(PausingTests, CliCase):
 
 
 class MenuTests(CliCase):
+    needs_bus = True
+
     def assert_only_asked(self, *names):
         """Nothing was started but the menu, the sampler (asked its status once, to build the menu) and the named."""
         self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", *names)
@@ -1766,56 +1887,53 @@ class MenuTests(CliCase):
     def test_today_so_far_does_what_today_notify_does(self):
         self.busy_day()
         self.stubs.choose_in_menu("Today so far")
-        result = self.ok("menu")
+        result = self.ok("menu", **self.on_bus)
         self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification("Today: 3h 07m", TODAY_BODY)])
+        self.assertEqual(self.sent(), [notification("Today: 3h 07m", TODAY_BODY)])
         # The menu asked the sampler for its status, and `today` asked again.
         self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS, STATUS])
-        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "omarchy-notification-send")
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell")
 
     def test_today_so_far_without_anything_counted(self):
         self.stubs.choose_in_menu("Today so far")
-        result = self.ok("menu")
+        result = self.ok("menu", **self.on_bus)
         self.assertEqual(result.stdout, "Today  nothing counted yet\n")
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"),
-                         [self.notification("Today: nothing counted yet", "")])
+        self.assertEqual(self.sent(), [notification("Today: nothing counted yet", "")])
 
     def test_today_so_far_asks_the_sampler_to_flush_and_tells_when_it_is_paused(self):
         self.busy_day()
         self.sampler(paused=True)
         self.stubs.choose_in_menu("Today so far")
         # A paused sampler is offered resume, but today is shown all the same.
-        result = self.ok("menu")
+        result = self.ok("menu", **self.on_bus)
         self.assertEqual(result.stdout.splitlines(), [TODAY + " (paused)"] + TODAY_ROWS)
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"),
-                         [self.notification("Today: 3h 07m", TODAY_BODY + " \u00b7 counting is paused")])
+        self.assertEqual(self.sent(), [notification("Today: 3h 07m", TODAY_BODY + " \u00b7 counting is paused")])
         self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS, STATUS, FLUSH])
 
     def test_pause_counting_does_what_pause_notify_does(self):
         # The sampler counts when the menu opens and has paused by the time it is asked again.
         self.samplers({}, {"paused": True})
         self.stubs.choose_in_menu("Pause counting")
-        result = self.ok("menu", **FAST)
+        result = self.ok("menu", **FAST, **self.on_bus)
         self.assertEqual(result.stdout,
                          "Counting is paused. `omawrapped resume`, or the widget's menu, starts it again.\n")
         self.assertEqual(self.stubs.argv("omarchy-bar"), [["set", PLUGIN_ID, "paused", "true", "--json"]])
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"),
-                         [self.notification("Counting paused", "Resume it from the widget's menu.")])
-        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "omarchy-bar", "omarchy-notification-send")
+        self.assertEqual(self.sent(), [notification("Counting paused", "Resume it from the widget's menu.")])
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "omarchy-bar")
 
     def test_pause_counting_without_a_sampler_saves_the_setting_and_says_nothing_on_the_desktop(self):
         self.stubs.choose_in_menu("Pause counting")
-        result = self.ok("menu", **FAST)
+        result = self.ok("menu", **FAST, **self.on_bus)
         self.assertEqual(result.stdout, "Saved. The sampler is not running; it will start paused.\n")
         self.assertEqual(self.stubs.argv("omarchy-bar"), [["set", PLUGIN_ID, "paused", "true", "--json"]])
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+        self.assertEqual(self.sent(), [])
 
     def test_pause_counting_that_the_sampler_does_not_follow_fails_as_pause_does(self):
         self.sampler()
         self.stubs.choose_in_menu("Pause counting")
         result = self.run_cli("menu", **FAST)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NOT_FOLLOWED))
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+        self.assertEqual(self.sent(), [])
 
     def test_pause_counting_without_omarchy_bar_fails_as_pause_does(self):
         self.stubs.remove("omarchy-bar")
@@ -1828,38 +1946,38 @@ class MenuTests(CliCase):
     def test_resume_counting_does_what_resume_notify_does(self):
         self.samplers({"paused": True}, {"paused": False})
         self.stubs.choose_in_menu("Resume counting")
-        result = self.ok("menu", **FAST)
+        result = self.ok("menu", **FAST, **self.on_bus)
         self.assertEqual(result.stdout, "Counting again.\n")
         self.assertEqual(self.stubs.argv("omarchy-bar"), [["set", PLUGIN_ID, "paused", "false", "--json"]])
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification("Counting again", "")])
-        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "omarchy-bar", "omarchy-notification-send")
+        self.assertEqual(self.sent(), [notification("Counting again", "")])
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "omarchy-bar")
 
     def test_resume_counting_that_the_sampler_does_not_follow_fails_as_resume_does(self):
         self.sampler(paused=True)
         self.stubs.choose_in_menu("Resume counting")
         result = self.run_cli("menu", **FAST)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NOT_FOLLOWED))
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+        self.assertEqual(self.sent(), [])
 
     def test_the_other_entries_leave_the_setting_alone(self):
         self.record()
         self.make_card()
         for label in ("Today so far", "Copy card", "Show in folder"):
             self.stubs.choose_in_menu(label)
-            self.ok("menu")
+            self.ok("menu", **self.on_bus)
         self.assertEqual(self.stubs.argv("omarchy-bar"), [])
 
     def test_copy_card_copies_the_newest_card_and_says_so(self):
         self.make_card("omawrapped-2026-10-09.png", mtime=1000)
         newest = self.make_card("omawrapped-2026-10-02.png", mtime=3000)
         self.stubs.choose_in_menu("Copy card")
-        result = self.ok("menu")
+        result = self.ok("menu", **self.on_bus)
         self.assertEqual(result.stdout, str(newest) + "\n")
         self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/png"]])
         self.assertEqual(self.stubs.stdin("wl-copy"), newest.read_bytes())
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(
+        self.assertEqual(self.sent(), [notification(
             "Card copied", "omawrapped-2026-10-02.png is on the clipboard. Paste it anywhere.", image=newest)])
-        self.assert_only_asked("wl-copy", "omarchy-notification-send")
+        self.assert_only_asked("wl-copy")
 
     def test_copy_card_without_a_card_fails_as_copy_does(self):
         self.stubs.choose_in_menu("Copy card")
@@ -1899,7 +2017,7 @@ class MenuTests(CliCase):
         self.record()
         self.stubs.choose_in_menu(label)
         expected = self.pictures / ("omawrapped-%s%s.png" % (self.today.isoformat(), suffix))
-        result = self.ok("menu")
+        result = self.ok("menu", **self.on_bus)
         self.assertEqual(result.stdout, str(expected) + "\n")
         self.assertEqual(os.listdir(self.pictures), [expected.name])
         data = expected.read_bytes()
@@ -1907,12 +2025,11 @@ class MenuTests(CliCase):
         self.assertEqual(self.stubs.wait_for_argv("xdg-open"), [[str(expected)]])
         self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/png"]])
         self.assertEqual(self.stubs.stdin("wl-copy"), data)
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(
+        self.assertEqual(self.sent(), [notification(
             "Card copied", "Paste it into a post. " + CLICK_HINT, image=expected,
             click=[str(LAUNCHER), "show", str(expected)])])
         self.assertIn("Saved %s (image copied)" % expected, result.stderr)
-        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "wl-copy", "xdg-open",
-                                    "omarchy-notification-send")
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "wl-copy", "xdg-open")
         return expected
 
     @needs_renderer
@@ -1958,12 +2075,14 @@ class MenuTests(CliCase):
         self.record()
         self.stubs.remove("xdg-open")
         self.stubs.choose_in_menu("Card of the last 7 days")
-        result = self.ok("menu")
+        result = self.ok("menu", **self.on_bus)
         self.assertIn(NO_XDG_OPEN, result.stderr)
-        self.assertEqual(len(self.stubs.argv("omarchy-notification-send")), 1)
+        self.assertEqual(len(self.sent()), 1)
 
 
 class StatusTests(CliCase):
+    needs_bus = True
+
     def test_names_the_data_folder_and_the_version(self):
         result = self.ok("status")
         self.assertIn("OmaWrapped " + VERSION, result.stdout)
@@ -2053,19 +2172,35 @@ class StatusTests(CliCase):
         lines = self.status_lines()
         first = next(number for number, line in enumerate(lines) if line.startswith("Clipboard"))
         self.assertEqual(lines[first:first + 5], [
-            "Clipboard wl-copy found", "Notify    omarchy-notification-send found",
+            "Clipboard wl-copy found", "Notify    over the session bus",
             "Menu      omarchy-menu-select found", "Pause     omarchy-bar found", "Files     nautilus found"])
 
-    def test_the_notification_tool(self):
-        self.assertIn("Notify    omarchy-notification-send found", self.status_lines())
-        self.stubs.remove("omarchy-notification-send")
-        self.assertIn("Notify    notify-send found", self.status_lines())
-        self.stubs.remove("notify-send")
-        self.assertIn("Notify    MISSING (no notifications; results are still printed)", self.status_lines())
+    def test_notifications_go_over_the_session_bus(self):
+        self.assertIn("Notify    over the session bus", self.status_lines(**self.on_bus))
+        self.assertIn("Notify    over the session bus", self.status_lines())
 
-    def test_omarchys_tool_alone_is_enough(self):
-        self.stubs.remove("notify-send")
-        self.assertIn("Notify    omarchy-notification-send found", self.status_lines())
+    def test_without_a_session_bus_the_line_says_so(self):
+        self.assertIn("Notify    MISSING (there is no session bus; results are still printed)",
+                      self.status_lines(DBUS_SESSION_BUS_ADDRESS=""))
+
+    def test_without_python_gobject_the_line_says_so(self):
+        self.assertIn("Notify    MISSING (python-gobject is not installed; results are still printed)",
+                      self.status_lines(**self.without_python_gobject()))
+        # It is the first thing a notification needs, so it is the one said when the bus is missing as well.
+        self.assertIn("Notify    MISSING (python-gobject is not installed; results are still printed)",
+                      self.status_lines(DBUS_SESSION_BUS_ADDRESS="", **self.without_python_gobject()))
+
+    def test_the_programs_that_used_to_send_notifications_have_no_say_in_it(self):
+        self.stubs.remove("omarchy-notification-send", "notify-send")
+        self.assertIn("Notify    over the session bus", self.status_lines())
+        self.assertIn("Notify    MISSING (there is no session bus; results are still printed)",
+                      self.status_lines(DBUS_SESSION_BUS_ADDRESS=""))
+
+    def test_looking_at_the_notifications_sends_none(self):
+        self.record()
+        self.ok("status", **self.on_bus)
+        self.assertEqual(self.sent(), [])
+        self.assert_nothing_started("omarchy-shell")
 
     def test_the_menu_tool(self):
         self.assertIn("Menu      omarchy-menu-select found", self.status_lines())
@@ -2093,9 +2228,9 @@ class StatusTests(CliCase):
 
     def test_a_machine_with_none_of_it_says_so_on_every_line(self):
         self.stubs.remove(*[name for name in STUBBED if name != "omarchy-shell"])
-        lines = self.status_lines()
+        lines = self.status_lines(DBUS_SESSION_BUS_ADDRESS="")
         for expected in ("Clipboard wl-copy MISSING (package wl-clipboard)",
-                         "Notify    MISSING (no notifications; results are still printed)",
+                         "Notify    MISSING (there is no session bus; results are still printed)",
                          "Menu      MISSING (the widget's middle-click menu needs Omarchy's menu)",
                          "Pause     MISSING (pausing needs Omarchy's bar command)",
                          "Files     MISSING"):
@@ -2254,7 +2389,705 @@ class ResetTests(CliCase):
         self.assertEqual(self.card.read_text(encoding="utf-8"), "a card I made")
 
 
-class IsolationTests(CliCase):
+# ---- The fixes for what a marketplace reviewer found ----
+#
+# Private activity data (the apps used and for how long, the e-mail the commits are made with, the folders the
+# projects are in) was given to other programs as arguments, and the arguments of a program can be read by every
+# user of the machine, in the process list. The groups below are one per fix.
+
+class ReviewerFindingTests(CliCase):
+    """Group 1: what is in the notification of `today` is not in any argument of any program."""
+
+    needs_bus = True
+    APPS = ["Ghostty", "Chromium", "Zed", "Slack", "Obsidian", "Signal"]
+    IDS = ["com.mitchellh.ghostty", "chromium", "zed", "slack", "obsidian", "signal"]
+    TIMES = ["3h 07m", "1h 20m", "52m", "31m", "14m", "6m", "4m"]
+
+    def setUp(self):
+        super().setUp()
+        self.busy_day()
+        self.sampler()
+        for tool in ("git", "rsvg-convert", "fc-match"):
+            self.stubs.spy(tool)
+
+    def started(self) -> dict:
+        return self.stubs.everything()
+
+    def assert_nothing_private_was_an_argument(self):
+        started = self.started()
+        self.assertEqual(leaks(started, self.APPS + self.IDS + self.TIMES, self.tmp), [])
+        # The programs that used to be given the notification as arguments were not started at all.
+        self.assertNotIn("omarchy-notification-send", started)
+        self.assertNotIn("notify-send", started)
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+        self.assertEqual(self.stubs.argv("notify-send"), [])
+
+    def test_today_so_far_in_the_menu_says_it_over_the_bus_and_starts_no_program_with_it(self):
+        self.stubs.choose_in_menu("Today so far")
+        result = self.ok("menu", **self.on_bus)
+        self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
+        self.assertEqual(self.sent(), [notification("Today: 3h 07m", TODAY_BODY)])
+        self.assertEqual(self.sent()[0]["summary"], "Today: " + clock(11220000))
+        for app in ("Ghostty", "Chromium", "Zed"):
+            self.assertIn(app, self.sent()[0]["body"])
+        # The programs that were started: the menu, and the sampler asked for its status and to flush.
+        self.assertEqual(sorted(self.started()), ["omarchy-menu-select", "omarchy-shell"])
+        self.assert_nothing_private_was_an_argument()
+
+    def test_today_notify_says_it_over_the_bus_and_starts_no_program_with_it(self):
+        result = self.ok("today", "--notify", **self.on_bus)
+        self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
+        self.assertEqual(self.sent(), [notification("Today: 3h 07m", TODAY_BODY)])
+        self.assertEqual(sorted(self.started()), ["omarchy-shell"])
+        self.assert_nothing_private_was_an_argument()
+
+    def test_the_check_would_have_caught_the_way_it_used_to_be_done(self):
+        # Without this a check that cannot fail would pass: what the notification program used to be given.
+        self.ok("today", "--notify", **self.on_bus)
+        subprocess.run([str(self.stubs.dir / "omarchy-notification-send"), "--app-name", "OmaWrapped", "-g", GLYPH,
+                        "Today: 3h 07m", TODAY_BODY], check=True, env={})
+        # The guard of every test is not to see this one.
+        self.addCleanup((self.stubs.logs / "omarchy-notification-send.log").unlink)
+        found = leaks(self.started(), self.APPS + self.IDS + self.TIMES, self.tmp)
+        self.assertEqual({program for program, _, _ in found}, {"omarchy-notification-send"})
+        self.assertIn(("omarchy-notification-send", "Today: 3h 07m", "a time"), found)
+        self.assertIn(("omarchy-notification-send", TODAY_BODY, "Ghostty"), found)
+        with self.assertRaises(AssertionError):
+            self.assert_nothing_private_was_an_argument()
+
+    def test_a_machine_without_a_bus_gets_the_numbers_on_stdout_and_nothing_else_started(self):
+        result = self.run_cli("today", "--notify")
+        self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
+        self.assertEqual(sorted(self.started()), ["omarchy-shell"])
+        self.assert_nothing_private_was_an_argument()
+
+
+class ArgumentAuditTests(CliCase):
+    """Group 2: over every command, what any program is started with holds nothing the user did."""
+
+    needs_bus = True
+    MENU_CHOICES = ("Today so far", "Card of the last 7 days", "Card of the last 30 days", "Copy card",
+                    "Show in folder", "Pause counting")
+
+    def setUp(self):
+        super().setUp()
+        self.record()
+        self.sampler()
+        self.repos = self.tmp / "repos"
+        self.secret = init_repo(self.repos / "secret-client")
+        for days in (1, 2, 3):
+            commit(self.secret, self.local(self.today - timedelta(days=days)))
+        # The widget's setting says where the projects are, the way a user sets it.
+        self.write(self.config / "omarchy" / "shell.json", json.dumps(
+            {"version": 1, "bar": {"layout": {"right": [{"id": PLUGIN_ID, "repoDirs": str(self.repos)}]}}}))
+        for tool in ("git", "rsvg-convert", "fc-match"):
+            self.stubs.spy(tool)
+
+    def private_words(self) -> list:
+        """The apps of the sample data by name and by id, the e-mail, the project's folder, the data folder."""
+        names = system.AppNames([])
+        apps = {app for raw in self.recorded().values() for app in raw["apps_ms"]}
+        return sorted({names.name(app) for app in apps} | apps | {
+            ME, OTHER, "secret-client", str(self.data_home), "example.invalid"})
+
+    def run_everything(self) -> None:
+        """Each command that starts a program, and each choice of the menu, once, with the bus there."""
+        env = {**FAST, **self.on_bus}
+        self.ok("card", "--week", "--open", "--copy", "image", "--notify", **env)
+        self.ok("card", "--month", "--copy", "path", **env)
+        self.ok("card", "-o", self.tmp / "x.svg", **env)
+        self.ok("copy", "--notify", **env)
+        self.ok("show", **env)
+        self.ok("today", "--notify", **env)
+        self.sampler(paused=True)
+        self.ok("pause", "--notify", **env)
+        self.sampler()
+        self.ok("resume", "--notify", **env)
+        self.ok("stats", **env)
+        self.ok("stats", "--json", **env)
+        self.ok("status", **env)
+        for label in self.MENU_CHOICES:
+            self.stubs.choose_in_menu(label)
+            if label == "Pause counting":
+                # The menu opens on a sampler that counts, and finds it paused when it looks again.
+                self.samplers({}, {"paused": True})
+            else:
+                self.sampler()
+            self.ok("menu", **env)
+        # The sixth entry is resume when the sampler is paused.
+        self.stubs.choose_in_menu("Resume counting")
+        self.samplers({"paused": True}, {"paused": False})
+        self.ok("menu", **env)
+        # xdg-open and nautilus are started detached: they may log after the command is done.
+        self.wait_for_calls("xdg-open", 3)
+        self.wait_for_calls("uwsm-app", 2)
+
+    def wait_for_calls(self, name: str, count: int) -> None:
+        deadline = time.monotonic() + 5
+        while len(self.stubs.argv(name)) < count and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    def test_no_argument_of_any_program_holds_anything_private(self):
+        self.run_everything()
+        started = self.stubs.everything()
+        # The audit looks at something: every program that can be started with an argument was.
+        for name in ("git", "rsvg-convert", "fc-match", "wl-copy", "xdg-open", "uwsm-app", "omarchy-shell",
+                     "omarchy-bar", "omarchy-menu-select"):
+            self.assertTrue(started.get(name), "%s was not started, so there is nothing to look at" % name)
+        self.assertEqual(sorted(started), sorted(["git", "rsvg-convert", "fc-match", "wl-copy", "xdg-open",
+                                                  "uwsm-app", "omarchy-shell", "omarchy-bar", "omarchy-menu-select"]))
+        # Each command that says something did say it, over the bus: eleven of them.
+        self.assertEqual(len(self.sent()), 11)
+        cards = {str(path) for path in self.pictures.glob("omawrapped-*.png")}
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(leaks(started, self.private_words(), self.tmp, cards), [])
+
+    def test_the_only_paths_are_the_cards_and_only_for_the_programs_that_open_or_show_them(self):
+        self.run_everything()
+        cards = {str(path) for path in self.pictures.glob("omawrapped-*.png")}
+        week = str(self.pictures / ("omawrapped-%s.png" % self.today.isoformat()))
+        month = str(self.pictures / ("omawrapped-%s-month.png" % self.today.isoformat()))
+        self.assertEqual(cards, {week, month})
+        everything = self.stubs.everything()
+        paths = {name: sorted({argument for call in calls for argument in call if argument.startswith(str(self.tmp))})
+                 for name, calls in everything.items()}
+        self.assertEqual({name: found for name, found in paths.items() if found},
+                         {"xdg-open": sorted([week, month]), "uwsm-app": [month]})
+        # The week's card was opened by `card` and by the menu; the month's by the menu alone.
+        self.assertEqual(everything["xdg-open"], [[week], [week], [month]])
+        # The card that `show` and the menu's entry showed is the newest in Pictures.
+        self.assertEqual(everything["uwsm-app"], [["--", "nautilus", "--select", month]] * 2)
+
+    def test_the_fixed_words_are_all_that_is_left(self):
+        self.run_everything()
+        everything = self.stubs.everything()
+        self.assertEqual({tuple(call) for call in everything["omarchy-shell"]},
+                         {(PLUGIN_ID, "status"), (PLUGIN_ID, "flush")})
+        self.assertEqual({tuple(call) for call in everything["omarchy-bar"]},
+                         {("set", PLUGIN_ID, "paused", word, "--json") for word in ("true", "false")})
+        self.assertEqual({tuple(call) for call in everything["wl-copy"]},
+                         {("--type", "text/plain"), ("--type", "image/png")})
+        self.assertEqual({tuple(call) for call in everything["rsvg-convert"]}, {("--format=png",)})
+        self.assertEqual({tuple(call) for call in everything["fc-match"]}, {("-f", "%{family[0]}", "monospace")})
+        self.assertEqual({call[0] for call in everything["omarchy-menu-select"]}, {"OmaWrapped"})
+        labels = {label for call in everything["omarchy-menu-select"] for label in call[1:]}
+        self.assertEqual(labels, set(MENU[1:] + [PAUSE, RESUME]))
+        for call in everything["git"]:
+            self.assertEqual(call[0], "--no-pager")
+            self.assertIn(call[1], ("config", "log"))
+
+    def test_git_was_started_in_the_project_and_not_told_where_it_is(self):
+        self.run_everything()
+        calls = self.stubs.argv("git")
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(self.stubs.cwds("git"), [str(self.secret)] * len(calls))
+        self.assertEqual([argument for call in calls for argument in call if "secret-client" in argument], [])
+        self.assertNotIn("-C", [argument for call in calls for argument in call])
+
+    def test_the_audit_sees_every_kind_of_leak(self):
+        # A check that cannot fail would pass. Each of these is the way it used to be done, or its like; the last
+        # five are what is allowed.
+        words = self.private_words()
+        card = str(self.pictures / "omawrapped-2026-10-09.png")
+        leaking = [
+            {"omarchy-notification-send": [["--app-name", "OmaWrapped", "Today: 3h 07m", "Ghostty 1h 20m"]]},
+            {"notify-send": [["Today: 52m"]]},
+            {"git": [["-C", str(self.secret), "log"]]},
+            {"git": [["log", "secret-client"]]},
+            {"git": [["log", "--author=" + ME]]},
+            {"wl-copy": [["--", card]]},
+            {"wl-copy": [["--select", card]]},
+            {"rsvg-convert": [["--format=png", "--output", str(self.tmp / "x.png")]]},
+            {"xdg-open": [[str(self.data_home / "omawrapped")]]},
+            {"xdg-open": [["/home/someone/slack.png"]]},
+            {"uwsm-app": [["--", "xdg-open", card]]},
+        ]
+        allowed = [
+            {"nautilus": [["--select", card]]},
+            {"xdg-open": [[card]]},
+            {"uwsm-app": [["--", "nautilus", "--select", card]]},
+            {"omarchy-menu-select": [["OmaWrapped", "Card of the last 7 days", "Today so far"]]},
+            {"omarchy-bar": [["set", PLUGIN_ID, "paused", "true", "--json"]]},
+        ]
+        for started in leaking:
+            with self.subTest(leaking=started):
+                self.assertTrue(leaks(started, words, self.tmp, {card}))
+        for started in allowed:
+            with self.subTest(allowed=started):
+                self.assertEqual(leaks(started, words, self.tmp, {card}), [])
+
+
+class ClipboardTests(CliCase):
+    """Group 3: the path of the card goes to the clipboard on the standard input of wl-copy, not in its arguments."""
+
+    def test_the_path_is_on_stdin_byte_for_byte_and_not_in_the_arguments(self):
+        self.record()
+        output = self.tmp / "my cards" / "café card.svg"
+        result = self.ok("card", "--copy", "path", "-o", output)
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "text/plain"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), str(output).encode("utf-8"))
+        self.assertFalse(self.stubs.stdin("wl-copy").endswith(b"\n"))
+        self.assertEqual(result.stdout, str(output) + "\n")
+
+    @needs_renderer
+    def test_the_default_card_is_copied_the_same_way(self):
+        self.record()
+        result = self.ok("card", "--copy", "path")
+        card = result.stdout.strip()
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "text/plain"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), card.encode("utf-8"))
+
+    @needs_renderer
+    def test_the_image_goes_on_stdin_too_and_the_path_is_not_an_argument(self):
+        self.record()
+        output = self.tmp / "secret-client" / "c.png"
+        self.ok("card", "--copy", "image", "-o", output)
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/png"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), output.read_bytes())
+
+    def test_nothing_is_copied_when_nothing_was_asked(self):
+        self.record()
+        self.ok("card", "--copy", "none", "-o", self.tmp / "c.svg")
+        self.assertEqual(self.stubs.argv("wl-copy"), [])
+
+
+class CardFileTests(CliCase):
+    """Group 4: a card is the user's alone, and a render that fails leaves nothing behind and the old card as it was."""
+
+    def test_a_png_and_an_svg_are_private_under_any_umask(self):
+        self.record()
+        for mask in (0o022, 0o000):
+            for name in ("c.png", "c.svg"):
+                with self.subTest(umask=oct(mask), name=name):
+                    output = self.tmp / ("%03o" % mask) / name
+                    self.ok("card", "-o", output, "--copy", "none", umask=mask)
+                    self.assertEqual(mode(output), 0o600)
+
+    def test_the_default_card_in_the_pictures_folder_is_private(self):
+        self.record()
+        result = self.ok("card", "--copy", "none", umask=0o022)
+        self.assertEqual(mode(Path(result.stdout.strip())), 0o600)
+
+    def test_a_card_that_replaces_a_world_readable_one_is_private_afterwards(self):
+        self.record()
+        for name in ("c.png", "c.svg"):
+            with self.subTest(name=name):
+                output = self.write(self.tmp / "out" / name, "old")
+                output.chmod(0o644)
+                self.ok("card", "-o", output, "--copy", "none", umask=0o022)
+                self.assertNotEqual(output.read_bytes(), b"old")
+                self.assertEqual(mode(output), 0o600)
+
+    def test_no_temporary_file_is_left_after_a_card(self):
+        self.record()
+        for name in ("c.png", "c.svg"):
+            self.ok("card", "-o", self.tmp / "out" / name, "--copy", "none")
+        self.ok("card", "--copy", "none")
+        self.assertEqual(sorted(os.listdir(self.tmp / "out")), ["c.png", "c.svg"])
+        self.assertEqual(list(self.tmp.rglob("*.part")), [])
+
+    def failing(self, how, said):
+        """A card to draw over an old one, while the renderer fails as `how` does: the old one stays as it was."""
+        self.record()
+        self.stubs.replace_tool("rsvg-convert")
+        how()
+        output = self.write(self.tmp / "out" / "c.png", "precious")
+        output.chmod(0o644)
+        for _ in range(2):
+            result = self.run_cli("card", "-o", output, "--copy", "none", "--notify")
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", said + "\n"))
+            self.assertEqual(output.read_text(encoding="utf-8"), "precious")
+            self.assertEqual(mode(output), 0o644)
+            self.assertEqual(os.listdir(output.parent), ["c.png"])
+            self.assertEqual(list(self.tmp.rglob("*.part")), [])
+        self.assertEqual(self.stubs.argv("rsvg-convert"), [["--format=png"]] * 2)
+
+    def test_a_renderer_that_fails_leaves_no_file_and_the_old_card_untouched(self):
+        self.failing(lambda: self.stubs.fail("rsvg-convert", 1, reason="not an svg\nline 1: boom"),
+                     "rsvg-convert could not render the card: line 1: boom")
+
+    def test_a_renderer_that_prints_nothing_leaves_no_file_and_the_old_card_untouched(self):
+        self.failing(lambda: None, "rsvg-convert could not render the card.")
+
+    @needs_renderer
+    def test_rsvg_convert_is_started_with_exactly_format_png(self):
+        self.record()
+        self.stubs.spy("rsvg-convert")
+        output = self.tmp / "secret-client" / "c.png"
+        self.ok("card", "-o", output, "--copy", "none")
+        self.assertEqual(self.stubs.argv("rsvg-convert"), [["--format=png"]])
+        self.assertEqual(struct.unpack(">II", output.read_bytes()[16:24]), (1600, 900))
+
+    @needs_renderer
+    def test_an_svg_is_not_rendered_at_all(self):
+        self.record()
+        self.stubs.spy("rsvg-convert")
+        self.ok("card", "-o", self.tmp / "c.svg", "--copy", "none")
+        self.assertEqual(self.stubs.argv("rsvg-convert"), [])
+
+
+class GitInTheRepositoryTests(CliCase):
+    """Group 5: git is started in the repository, which no argument names."""
+
+    def test_stats_and_cards_start_git_in_the_repository_and_name_it_to_nobody(self):
+        repos = self.tmp / "repos"
+        secret = init_repo(repos / "secret-client")
+        commit(secret, self.local(self.today - timedelta(days=1)))
+        commit(secret, self.local(self.today - timedelta(days=2)))
+        commit(secret, self.local(self.today - timedelta(days=1)), email=OTHER)
+        other = init_repo(repos / "deep" / "other-client")
+        commit(other, self.local(self.today - timedelta(days=3)))
+        self.record()
+        self.stubs.spy("git")
+        self.assertEqual(self.stats("--repos", repos)["commits"], 3)
+        self.ok("stats", "--repos", repos)
+        self.ok("card", "-o", self.tmp / "c.svg", "--copy", "none", "--repos", repos)
+        calls = self.stubs.argv("git")
+        self.assertGreaterEqual(len(calls), 6)
+        self.assertEqual(set(self.stubs.cwds("git")), {str(secret), str(other)})
+        self.assertEqual(len(self.stubs.cwds("git")), len(calls))
+        for arguments in calls:
+            self.assertEqual(arguments[0], "--no-pager")
+            self.assertNotIn("-C", arguments)
+            for argument in arguments:
+                self.assertNotIn("client", argument)
+                self.assertNotIn(str(self.tmp), argument)
+                self.assertNotIn(ME, argument)
+
+    def test_status_counts_repositories_without_starting_git(self):
+        repos = self.tmp / "repos"
+        init_repo(repos / "secret-client")
+        self.write(self.config / "omarchy" / "shell.json", json.dumps(
+            {"version": 1, "bar": {"layout": {"right": [{"id": PLUGIN_ID, "repoDirs": str(repos)}]}}}))
+        self.stubs.spy("git")
+        self.assertIn("1 repository under %s" % repos, self.ok("status").stdout)
+        self.assertEqual(self.stubs.argv("git"), [])
+
+
+class FailuresOnTheDesktopTests(CliCase):
+    """Group 6: a command that the desktop started says why it failed itself, over the bus, and exits 3.
+
+    The widget used to take the first line of stderr and give it to the notification program as an argument.
+    """
+
+    needs_bus = True
+
+    def first_line(self) -> str:
+        return "Nothing was recorded for the last 7 days (%s)." % aggregate.last_days(7, self.today).span
+
+    def said_on_the_desktop(self, message: str) -> list:
+        return [notification("OmaWrapped", message)]
+
+    # ---- the menu ----
+
+    def test_copy_card_without_a_card_exits_3_says_why_on_stderr_and_on_the_bus(self):
+        self.stubs.choose_in_menu("Copy card")
+        result = self.run_cli("menu", **self.on_bus)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", NO_CARD + "\n"))
+        self.assertEqual(self.sent(), self.said_on_the_desktop(NO_CARD))
+        self.assertEqual(self.sent()[0]["summary"], "OmaWrapped")
+        self.assertEqual(self.sent()[0]["body"], "There is no card yet. Draw one with `omawrapped card`, "
+                                                 "or click the widget.")
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell")
+
+    def test_without_a_bus_the_same_run_exits_1_and_sends_nothing(self):
+        self.stubs.choose_in_menu("Copy card")
+        for name, address in (("none named", ""), ("a dead one", isolated_env(self.tmp)["DBUS_SESSION_BUS_ADDRESS"])):
+            with self.subTest(bus=name):
+                result = self.run_cli("menu", DBUS_SESSION_BUS_ADDRESS=address)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NO_CARD + "\n"))
+        result = self.run_cli("menu", **self.without_python_gobject(), **self.on_bus)
+        self.assertEqual((result.returncode, result.stderr), (1, NO_CARD + "\n"))
+        self.assertEqual(self.sent(), [])
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell")
+
+    def test_a_service_that_refuses_leaves_the_exit_status_at_1(self):
+        self.stubs.choose_in_menu("Copy card")
+        self.bus.refuse(True)
+        result = self.run_cli("menu", **self.on_bus)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NO_CARD + "\n"))
+        self.assertEqual(self.sent(), [])
+
+    def test_a_missing_menu_is_said(self):
+        self.stubs.remove("omarchy-menu-select")
+        result = self.run_cli("menu", **self.on_bus)
+        self.assertEqual((result.returncode, result.stderr), (3, NO_MENU + "\n"))
+        self.assertEqual(self.sent(), self.said_on_the_desktop(NO_MENU))
+
+    def test_a_menu_that_breaks_is_said(self):
+        self.stubs.fail("omarchy-menu-select", 2)
+        said = "omarchy-menu-select failed, so there is no menu to show."
+        result = self.run_cli("menu", **self.on_bus)
+        self.assertEqual((result.returncode, result.stderr), (3, said + "\n"))
+        self.assertEqual(self.sent(), self.said_on_the_desktop(said))
+
+    def test_an_answer_that_is_not_an_option_is_said(self):
+        self.stubs.choose_in_menu("Delete everything")
+        self.make_card()
+        self.assertEqual(self.run_cli("menu", **self.on_bus).returncode, 3)
+        self.assertEqual(self.sent(), self.said_on_the_desktop(
+            "The menu answered 'Delete everything', which is not one of its options."))
+
+    def test_a_card_from_the_menu_without_data_says_the_first_line_only(self):
+        self.stubs.choose_in_menu("Card of the last 7 days")
+        result = self.run_cli("menu", **self.on_bus)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(len(result.stderr.splitlines()), 3)
+        self.assertEqual(self.sent(), self.said_on_the_desktop(self.first_line()))
+
+    def test_a_menu_that_is_dismissed_or_succeeds_says_nothing_and_keeps_its_status(self):
+        self.record()
+        self.make_card()
+        self.assertEqual(self.run_cli("menu", **self.on_bus).returncode, 0)
+        self.stubs.choose_in_menu("Copy card")
+        self.assertEqual(self.run_cli("menu", **self.on_bus).returncode, 0)
+        self.assertEqual(self.sent(), [notification(
+            "Card copied", "omawrapped-2026-10-02.png is on the clipboard. Paste it anywhere.",
+            image=self.pictures / "omawrapped-2026-10-02.png")])
+
+    # ---- commands with --notify ----
+
+    def test_card_notify_with_nothing_recorded_exits_3_and_says_the_first_line_of_the_reason_only(self):
+        result = self.run_cli("card", "--week", "--notify", **self.on_bus)
+        self.assertEqual((result.returncode, result.stdout), (3, ""))
+        # stderr is what it was: all three lines.
+        span = aggregate.last_days(7, self.today).span
+        self.assertEqual(result.stderr, "Nothing was recorded for the last 7 days (%s).\n"
+                                        "OmaWrapped counts while its widget is enabled in the bar: "
+                                        "omarchy plugin enable %s\nData folder: %s\n" % (
+                                            span, PLUGIN_ID, self.data_home / "omawrapped"))
+        self.assertEqual(self.sent(), self.said_on_the_desktop(self.first_line()))
+
+    def test_card_notify_without_a_bus_exits_1_and_sends_nothing(self):
+        result = self.run_cli("card", "--week", "--notify")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(result.stderr.splitlines()), 3)
+        self.assertEqual(self.sent(), [])
+        self.bus.refuse(True)
+        self.assertEqual(self.run_cli("card", "--week", "--notify", **self.on_bus).returncode, 1)
+        self.assertEqual(self.sent(), [])
+
+    def test_a_paused_or_counting_sampler_is_said_in_its_one_line(self):
+        paused = ("OmaWrapped has counted less than a minute for the last 7 days, and counting is paused. "
+                  "Resume it from the widget's menu or with `omawrapped resume`.")
+        counting = ("OmaWrapped has counted less than a minute for the last 7 days so far. "
+                    "It is counting now: try again in a minute.")
+        self.sampler(paused=True)
+        self.assertEqual(self.run_cli("card", "--notify", **self.on_bus).returncode, 3)
+        self.assertEqual(self.sent(), self.said_on_the_desktop(paused))
+        self.sampler()
+        self.assertEqual(self.run_cli("card", "--notify", **self.on_bus).returncode, 3)
+        self.assertEqual(self.sent()[1:], self.said_on_the_desktop(counting))
+
+    def test_a_theme_that_is_not_one_is_said_as_it_is(self):
+        self.record()
+        empty = self.tmp / "no-such-theme"
+        empty.mkdir()
+        result = self.run_cli("card", "--theme", empty, "--notify", **self.on_bus)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(self.sent(), self.said_on_the_desktop(
+            "%s is not a theme folder: it has no colors.toml." % empty))
+
+    def test_a_renderer_that_fails_is_said_with_its_reason(self):
+        self.record()
+        self.stubs.replace_tool("rsvg-convert")
+        self.stubs.fail("rsvg-convert", 1, reason="line 1: boom")
+        result = self.run_cli("card", "-o", self.tmp / "c.png", "--notify", **self.on_bus)
+        said = "rsvg-convert could not render the card: line 1: boom"
+        self.assertEqual((result.returncode, result.stderr), (3, said + "\n"))
+        self.assertEqual(self.sent(), self.said_on_the_desktop(said))
+
+    def test_copy_notify_says_why_it_could_not_copy(self):
+        result = self.run_cli("copy", "--notify", **self.on_bus)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", NO_CARD + "\n"))
+        self.assertEqual(self.sent(), self.said_on_the_desktop(NO_CARD))
+        self.bus.clear()
+        missing = self.tmp / "nowhere.png"
+        self.assertEqual(self.run_cli("copy", missing, "--notify", **self.on_bus).returncode, 3)
+        self.assertEqual(self.sent(), self.said_on_the_desktop("%s does not exist." % missing))
+
+    def test_pause_and_resume_notify_say_why_they_could_not_do_it(self):
+        self.stubs.remove("omarchy-bar")
+        for command, word in (("pause", "saved"), ("resume", "lifted")):
+            with self.subTest(command=command):
+                self.bus.clear()
+                result = self.run_cli(command, "--notify", **self.on_bus)
+                said = "omarchy-bar was not found, so the pause could not be %s. It is part of Omarchy 4." % word
+                self.assertEqual((result.returncode, result.stderr), (3, said + "\n"))
+                self.assertEqual(self.sent(), self.said_on_the_desktop(said))
+
+    def test_today_notify_without_a_bus_prints_the_numbers_and_says_why_it_could_not_say_them(self):
+        self.busy_day()
+        sentence = ("Today could not be shown on the desktop: the notification service did not answer. "
+                    "`omawrapped today` in a terminal prints it.")
+        result = self.run_cli("today", "--notify")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
+        self.assertEqual(result.stderr, sentence + "\n")
+        self.assertEqual(self.sent(), [])
+
+    def test_the_sentence_names_the_reason_the_desktop_could_not_be_told(self):
+        self.busy_day()
+        sentence = ("Today could not be shown on the desktop: %s. `omawrapped today` in a terminal prints it.\n")
+        cases = [
+            ("no session bus", {"DBUS_SESSION_BUS_ADDRESS": ""}, "there is no session bus"),
+            ("python-gobject missing", {**self.without_python_gobject(), **self.on_bus},
+             "python-gobject is not installed"),
+            ("a dead address", {}, "the notification service did not answer"),
+            ("a service that refuses", self.on_bus, "the notification service did not answer"),
+        ]
+        for name, env, reason in cases:
+            with self.subTest(case=name):
+                self.bus.reset()
+                if name == "a service that refuses":
+                    self.bus.refuse(True)
+                result = self.run_cli("today", "--notify", **env)
+                self.assertEqual((result.returncode, result.stderr), (1, sentence % reason))
+                self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
+                self.assertEqual(self.sent(), [])
+
+    def test_today_notify_with_the_bus_is_a_success(self):
+        self.busy_day()
+        self.assertEqual(self.run_cli("today", "--notify", **self.on_bus).returncode, 0)
+
+    # ---- what does not change ----
+
+    def test_a_failure_without_notify_exits_1_and_sends_nothing_even_with_the_bus_up(self):
+        self.stubs.remove("omarchy-bar")
+        for args in (("card", "--week"), ("copy",), ("show",), ("pause",), ("resume",), ("reset",)):
+            with self.subTest(command=args):
+                result = self.run_cli(*args, **self.on_bus)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotEqual(result.stderr, "")
+        self.assertEqual(self.sent(), [])
+
+    def test_a_warning_on_a_card_that_was_made_is_not_a_failure(self):
+        self.record()
+        self.stubs.fail("wl-copy")
+        output = self.tmp / "c.svg"
+        result = self.run_cli("card", "-o", output, "--notify", **self.on_bus)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(COPY_FAILED, result.stderr)
+        self.assertEqual([sent["summary"] for sent in self.sent()], ["Card saved"])
+
+    def test_an_error_in_the_arguments_exits_2_and_says_nothing_on_the_desktop(self):
+        result = self.run_cli("card", "--days", "0", "--notify", **self.on_bus)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.run_cli("today", "--notify", "--days", "3", **self.on_bus).returncode, 2)
+        self.assertEqual(self.run_cli("menu", "--notify", **self.on_bus).returncode, 2)
+        self.assertEqual(self.sent(), [])
+
+    def test_the_status_is_3_because_the_widget_asks_for_it(self):
+        self.assertEqual(cli.SAID_ON_DESKTOP, 3)
+        self.assertNotIn(cli.SAID_ON_DESKTOP, (0, 1, 2, 130))
+
+    def test_no_program_is_started_to_say_it(self):
+        self.stubs.choose_in_menu("Copy card")
+        self.run_cli("menu", **self.on_bus)
+        self.run_cli("card", "--week", "--notify", **self.on_bus)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+        self.assertEqual(self.stubs.argv("notify-send"), [])
+
+
+class MainInProcessTests(StubbedCase):
+    """main() called in this process, as the tests of the other groups cannot: it forgets what a run said."""
+
+    needs_bus = True
+
+    def setUp(self):
+        super().setUp()
+        self.use_bus()
+        # main() puts the signal for a closed pipe back to its default; the test runner is not to be changed.
+        patcher = mock.patch.object(cli.signal, "signal")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = cli.main(list(argv))
+        return status, out.getvalue(), err.getvalue()
+
+    def say(self, *messages, status=1):
+        """A stand-in for `_today` that says these things and ends with this status."""
+        def today(notify):
+            for message in messages:
+                cli._say(message)
+            return status
+        return mock.patch.object(cli, "_today", today)
+
+    def test_a_failure_from_the_desktop_is_said_there_and_exits_3(self):
+        self.assertEqual(self.main("copy", "--notify"), (3, "", NO_CARD + "\n"))
+        self.assertEqual(self.bus.notifications(), [notification("OmaWrapped", NO_CARD)])
+
+    def test_the_menu_counts_as_the_desktop_without_the_option(self):
+        self.stubs.choose_in_menu("Show in folder")
+        self.assertEqual(self.main("menu"), (3, "", NO_CARD + "\n"))
+        self.assertEqual(self.bus.notifications(), [notification("OmaWrapped", NO_CARD)])
+
+    def test_another_command_does_not_count_as_the_desktop(self):
+        self.assertEqual(self.main("copy"), (1, "", NO_CARD + "\n"))
+        self.assertEqual(self.main("show"), (1, "", NO_CARD + "\n"))
+        self.assertEqual(self.bus.notifications(), [])
+
+    def test_it_is_the_last_thing_said_that_is_said_and_only_its_first_line(self):
+        with self.say("The first thing", "The second thing\nand the rest of it", "The last thing\nwith more"):
+            self.assertEqual(self.main("today", "--notify")[0], 3)
+        self.assertEqual(self.bus.notifications(), [notification("OmaWrapped", "The last thing")])
+
+    def test_what_a_run_said_is_forgotten_by_the_next_run(self):
+        self.assertEqual(self.main("copy")[0], 1)
+        self.assertEqual(cli._said, [NO_CARD])
+        # This run fails without a word: the old message is not its to say.
+        with self.say():
+            self.assertEqual(self.main("today", "--notify"), (1, "", ""))
+        self.assertEqual(cli._said, [])
+        self.assertEqual(self.bus.notifications(), [])
+        self.assertEqual(self.main("copy")[0], 1)
+        self.assertEqual(self.main()[0], 0)
+        self.assertEqual(cli._said, [])
+
+    def test_a_status_other_than_1_is_left_alone(self):
+        for status in (0, 2, 3, 4):
+            with self.subTest(status=status):
+                with self.say("Something was said", status=status):
+                    self.assertEqual(self.main("today", "--notify")[0], status)
+        self.assertEqual(self.bus.notifications(), [])
+
+    def test_an_interrupt_is_130_and_says_nothing(self):
+        def interrupted(notify):
+            cli._say("Something was said first")
+            raise KeyboardInterrupt
+        with mock.patch.object(cli, "_today", interrupted):
+            self.assertEqual(self.main("today", "--notify")[0], 130)
+        self.assertEqual(self.bus.notifications(), [])
+
+    def test_a_message_with_nothing_to_say_is_not_sent(self):
+        for message in ("", "   ", "\n\n"):
+            with self.subTest(message=message):
+                with self.say(message):
+                    self.assertEqual(self.main("today", "--notify")[0], 1)
+        self.assertEqual(self.bus.notifications(), [])
+
+    def test_the_headline_is_the_name_of_the_app(self):
+        with mock.patch.object(share, "APP_NAME", "Renamed"):
+            self.assertEqual(self.main("copy", "--notify")[0], 3)
+        self.assertEqual(self.bus.notifications()[0]["summary"], "Renamed")
+
+    def test_a_service_that_refuses_leaves_the_status_at_1(self):
+        self.bus.refuse(True)
+        self.assertEqual(self.main("copy", "--notify")[0], 1)
+
+    def test_stderr_is_the_same_with_and_without_the_bus(self):
+        with_bus = self.main("copy", "--notify")
+        with mock.patch.dict(os.environ, {"DBUS_SESSION_BUS_ADDRESS": ""}):
+            without = self.main("copy", "--notify")
+        self.assertEqual((with_bus[1], with_bus[2]), (without[1], without[2]))
+        self.assertEqual((with_bus[0], without[0]), (3, 1))
+
+
+class IsolationTests(OnTheBus, CliCase):
     """The tests that matter most: nothing may reach the real desktop, clipboard or data."""
 
     def test_the_environment_of_a_run_holds_only_the_fake_machine(self):
@@ -2269,6 +3102,50 @@ class IsolationTests(CliCase):
             self.assertTrue(folder.startswith(str(self.tmp)), folder)
         for name in ("WAYLAND_DISPLAY", "DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "SSH_AUTH_SOCK"):
             self.assertNotIn(name, env)
+
+    def test_a_run_has_a_session_bus_that_is_not_there(self):
+        # So that no test can notify the person who runs the suite, however it is written. A test that wants to
+        # see a notification starts a bus of its own and says so.
+        address = self.environment()["DBUS_SESSION_BUS_ADDRESS"]
+        self.assertEqual(address, "unix:path=%s" % (self.tmp / "run" / "no-bus"))
+        self.assertTrue(address.startswith("unix:path=" + str(self.tmp) + "/"))
+        self.assertFalse(Path(address[len("unix:path="):]).exists())
+        self.assertFalse((self.tmp / "run" / "bus").exists())
+
+    def test_the_isolated_environment_names_a_bus_inside_its_root_that_does_not_exist(self):
+        root = self.tmp / "another-root"
+        address = isolated_env(root)["DBUS_SESSION_BUS_ADDRESS"]
+        self.assertEqual(address, "unix:path=%s/run/no-bus" % root)
+        self.assertFalse(Path(address[len("unix:path="):]).exists())
+        self.assertFalse(root.exists())
+
+    def test_the_variable_of_the_real_session_is_replaced_not_left_in_place(self):
+        # The environment is patched without clearing what was there: the explicit value is what keeps a real
+        # address out. Pretend the suite is run from a desktop session.
+        real = "unix:path=/run/user/1000/bus"
+        with mock.patch.dict(os.environ, {"DBUS_SESSION_BUS_ADDRESS": real}):
+            inner = IsolatedCase("write")
+            inner.setUp()
+            try:
+                self.assertEqual(os.environ["DBUS_SESSION_BUS_ADDRESS"], "unix:path=%s/run/no-bus" % inner.tmp)
+                self.assertNotEqual(share._bus_address(), real)
+            finally:
+                inner.doCleanups()
+            self.assertEqual(os.environ["DBUS_SESSION_BUS_ADDRESS"], real)
+
+    def test_in_this_process_too_the_bus_is_inside_the_fake_machine(self):
+        self.assertTrue(share._bus_address().startswith("unix:path=" + str(self.tmp) + "/"), share._bus_address())
+        self.assertFalse(Path(share._bus_address()[len("unix:path="):]).exists())
+        self.assertIs(share.notify("Nobody is to see this"), False)
+        self.assertEqual(self.sent(), [])
+
+    def test_a_run_that_is_not_given_the_test_bus_cannot_reach_it(self):
+        self.assertNotEqual(self.environment()["DBUS_SESSION_BUS_ADDRESS"], self.bus.address)
+        self.busy_day()
+        dead = self.environment()["DBUS_SESSION_BUS_ADDRESS"]
+        result = self.run_cli("today", "--notify", DBUS_SESSION_BUS_ADDRESS=dead)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.sent(), [])
 
     def test_the_environment_and_the_temporary_folder_are_restored_after_a_test(self):
         before = dict(os.environ)
@@ -2345,27 +3222,29 @@ class IsolationTests(CliCase):
             ["set", PLUGIN_ID, "paused", "true", "--json"], ["set", PLUGIN_ID, "paused", "false", "--json"],
             ["set", PLUGIN_ID, "paused", "true", "--json"], ["set", PLUGIN_ID, "paused", "false", "--json"]])
         self.assertEqual(self.stubs.argv("wl-copy"), [
-            ["--", str(self.tmp / "c.svg")], ["--type", "image/png"], ["--type", "image/svg+xml"],
-            ["--type", "image/png"]])
+            ["--type", "text/plain"], ["--type", "image/png"], ["--type", "image/svg+xml"], ["--type", "image/png"]])
+        self.assertEqual(self.stubs.stdin("wl-copy", 0), str(self.tmp / "c.svg").encode())
         self.assertEqual(self.stubs.calls("xdg-open"), [str(self.tmp / "c.svg")])
         self.assertEqual(self.stubs.argv("uwsm-app"), [
             ["--", "nautilus", "--select", str(card)], ["--", "nautilus", "--select", str(self.tmp / "c.svg")],
             ["--", "nautilus", "--select", str(card)]])
-        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [
-            self.notification("Card saved", "Its path is on the clipboard. " + CLICK_HINT,
-                              click=[str(LAUNCHER), "show", str(self.tmp / "c.svg")]),
-            self.notification("Card copied", "%s is on the clipboard. Paste it anywhere." % card.name, image=card),
-            self.notification("Card copied", "%s is on the clipboard. Paste it anywhere." % card.name, image=card),
-            self.notification("Today: 3h 07m", TODAY_BODY),
-            self.notification("Today: 3h 07m", TODAY_BODY),
-            self.notification("Counting paused", "Resume it from the widget's menu."),
-            self.notification("Counting again", ""),
-            self.notification("Counting paused", "Resume it from the widget's menu."),
-            self.notification("Counting again", "")])
+        self.assertEqual(self.sent(), [
+            notification("Card saved", "Its path is on the clipboard. " + CLICK_HINT,
+                         click=[str(LAUNCHER), "show", str(self.tmp / "c.svg")]),
+            notification("Card copied", "%s is on the clipboard. Paste it anywhere." % card.name, image=card),
+            notification("Card copied", "%s is on the clipboard. Paste it anywhere." % card.name, image=card),
+            notification("Today: 3h 07m", TODAY_BODY),
+            notification("Today: 3h 07m", TODAY_BODY),
+            notification("Counting paused", "Resume it from the widget's menu."),
+            notification("Counting again", ""),
+            notification("Counting paused", "Resume it from the widget's menu."),
+            notification("Counting again", "")])
         self.assertEqual(len(self.stubs.argv("omarchy-menu-select")), 6)
-        # Nothing but the stand-ins can have been reached, so nothing else was.
+        # Nothing but the stand-ins can have been reached, so nothing else was. The notifications went over the
+        # bus: the programs that used to send them were not started.
         self.assertEqual(self.stubs.argv("nautilus"), [])
         self.assertEqual(self.stubs.argv("notify-send"), [])
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
 
 
 if __name__ == "__main__":

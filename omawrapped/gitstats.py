@@ -84,12 +84,16 @@ def _walk(dirs) -> tuple:
 
 
 def _git(repo, *args):
-    """Output of a git command in repo, or None when it fails. Raises TimeoutExpired when it hangs."""
+    """Output of a git command in repo, or None when it fails. Raises TimeoutExpired when it hangs.
+
+    git is started in the repository's folder, not given it as an argument: the arguments of a program can be read
+    by every user of the machine, and the name of a project may say who it is for.
+    """
     env = {name: value for name, value in os.environ.items() if name not in REDIRECTS}
     try:
         done = subprocess.run(
-            ["git", "-C", str(repo), "--no-pager", *args],
-            capture_output=True, text=True, errors="replace", timeout=TIMEOUT,
+            ["git", "--no-pager", *args],
+            capture_output=True, text=True, errors="replace", timeout=TIMEOUT, cwd=str(repo),
             stdin=subprocess.DEVNULL, env={**env, **ENV},
         )
     except subprocess.TimeoutExpired:

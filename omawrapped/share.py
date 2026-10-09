@@ -1,9 +1,17 @@
 """Hands a finished card to the desktop: the clipboard, the file manager, a notification, Omarchy's menu.
 
-Every helper starts a program that ships with Omarchy. It looks for the program first and raises ShareError, with a
-sentence that can be shown to the user as it is, when it cannot do its job.
+The helpers for the clipboard, the file manager and the menu start a program that ships with Omarchy. Each looks
+for its program first and raises ShareError, with a sentence that can be shown to the user as it is, when it cannot
+do its job.
+
+What a program is started with can be read by every user of the machine, in the process list. So nothing about
+what the user did goes into a program's arguments: a notification is sent from here, over the session bus, and
+text for the clipboard goes in through the program's standard input. The only thing of the user's that is ever
+an argument is the path of the card, for the two programs that open it.
 """
 
+import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -50,20 +58,23 @@ def latest_card():
 
 # ---- the clipboard ----
 
-def _wl_copy(arguments: list, source: Path = None) -> None:
-    """Runs wl-copy with the arguments and, when given, the file `source` on its standard input."""
+def _wl_copy(arguments: list, source: Path = None, text: str = None) -> None:
+    """Runs wl-copy with the arguments. What it copies comes in on its standard input: the file `source` or `text`."""
     if not shutil.which("wl-copy"):
         raise ShareError("wl-copy was not found (package wl-clipboard), so nothing was copied.")
     try:
-        stdin = open(source, "rb") if source else subprocess.DEVNULL
+        stdin = open(source, "rb") if source else None
     except OSError as error:
         raise ShareError("%s could not be read, so nothing was copied." % source) from error
     # wl-copy stays behind to serve the clipboard. It must not inherit a
     # pipe of ours, or reading that pipe would wait for it forever.
     quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     try:
-        done = subprocess.run(["wl-copy", *arguments], stdin=stdin, timeout=TIMEOUT, **quiet)
-    except (OSError, subprocess.SubprocessError) as error:
+        if source:
+            done = subprocess.run(["wl-copy", *arguments], stdin=stdin, timeout=TIMEOUT, **quiet)
+        else:
+            done = subprocess.run(["wl-copy", *arguments], input=os.fsencode(text), timeout=TIMEOUT, **quiet)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise ShareError("wl-copy could not copy the card. Is a Wayland session running?") from error
     finally:
         if source:
@@ -80,7 +91,7 @@ def copy_image(path: Path) -> None:
 
 def copy_path(path: Path) -> None:
     """Puts the file's path on the clipboard, as text."""
-    _wl_copy(["--", str(path)])
+    _wl_copy(["--type", "text/plain"], text=str(path))
 
 
 # ---- the file manager ----
@@ -116,35 +127,88 @@ def show_in_folder(path: Path) -> None:
 
 # ---- notifications and the menu ----
 
-def notify(headline: str, body: str = "", image: Path = None, click: list = None) -> bool:
-    """Says something on the desktop. True when a notification was sent.
+NOTIFICATIONS = "org.freedesktop.Notifications"
 
-    Omarchy's own tool is preferred: it can make the notification clickable,
-    and click is the command a click runs. The outcome of whatever this is
-    about was already printed, so a desktop without notifications is not an
-    error here, only a False.
+
+def _bus_address():
+    """Where the session bus listens, or None when there is none. One is never started from here."""
+    address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    # "autolaunch:" asks for a bus to be started; that is not this command's to do.
+    if address and not address.startswith("autolaunch:"):
+        return address
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and Path(runtime, "bus").exists():
+        return "unix:path=%s/bus" % runtime
+    return None
+
+
+def _gio():
+    """(Gio, GLib) from python-gobject, which Omarchy ships. Raises ImportError or ValueError without it."""
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    return Gio, GLib
+
+
+def cannot_notify():
+    """Why no notification can be sent, in a few words. None when one can."""
+    try:
+        _gio()
+    except (ImportError, ValueError):
+        return "python-gobject is not installed"
+    return None if _bus_address() else "there is no session bus"
+
+
+def notify(headline: str, body: str = "", image: Path = None, click: list = None) -> bool:
+    """Says something on the desktop. True when the notification service took it.
+
+    The notification is handed to the service by this process, over the
+    session bus. It is never given to a program to send, not Omarchy's
+    omarchy-notification-send either: that would put the text into the
+    program's arguments, where every user of the machine can read it, and a
+    notification may say which apps were used and for how long.
+
+    What is sent is what omarchy-notification-send sends: Omarchy's shell
+    takes the icon from the omarchy-glyph hint and runs click, a command as a
+    list of words, when the notification is clicked. The outcome of whatever
+    this is about was already printed, so a desktop without notifications is
+    not an error here, only a False.
     """
-    if shutil.which("omarchy-notification-send"):
-        command = ["omarchy-notification-send", "--app-name", APP_NAME, "-g", GLYPH]
-        if image:
-            command += ["--image", str(image)]
-        command += [headline, body]
-        # --exec takes the rest of the line as the command, so it has to come last.
-        if click:
-            command += ["--exec", *map(str, click)]
-    elif shutil.which("notify-send"):
-        command = ["notify-send", "-a", APP_NAME]
-        if image:
-            command += ["-i", str(image)]
-        command += [headline, body]
-    else:
+    address = _bus_address()
+    if not address:
         return False
     try:
-        done = subprocess.run(command, timeout=TIMEOUT, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
+        Gio, GLib = _gio()
+    except (ImportError, ValueError):
         return False
-    return done.returncode == 0
+    try:
+        hints = {"urgency": GLib.Variant("y", 0), "omarchy-glyph": GLib.Variant("s", GLYPH)}
+        if image:
+            hints["image-path"] = GLib.Variant("s", str(image))
+        if click:
+            words = json.dumps([str(word) for word in click], ensure_ascii=False, separators=(",", ":"))
+            hints["omarchy-exec-argv"] = GLib.Variant("s", words)
+        # app name, id to replace, app icon, summary, body, actions, hints, the server's own expiry time
+        message = GLib.Variant("(susssasa{sv}i)", (APP_NAME, 0, "", headline, body, [], hints, -1))
+        flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
+        connection = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
+        try:
+            connection.call_sync(NOTIFICATIONS, "/org/freedesktop/Notifications", NOTIFICATIONS, "Notify", message,
+                                 GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, TIMEOUT * 1000, None)
+        finally:
+            _hang_up(connection, GLib)
+    # GLib.Error: no bus or no service there. The others: text that cannot be sent, such as half a character.
+    except (GLib.Error, TypeError, ValueError):
+        return False
+    return True
+
+
+def _hang_up(connection, GLib) -> None:
+    """Closes the connection. A notification that was taken stays taken if the goodbye fails."""
+    try:
+        connection.close_sync(None)
+    except GLib.Error:
+        pass
 
 
 def choose(prompt: str, options: list):

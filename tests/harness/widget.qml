@@ -113,13 +113,14 @@ ShellRoot {
     }],
     [4000, function() {
       equal("not busy once the command is done", widget.busy, false)
-      var sent = notifications()
-      equal("the failure is notified once", sent.length, 1)
-      equal("under the app's name, with its icon", (sent[0] || []).slice(0, 5).join("|"),
-        "--app-name|OmaWrapped|-g|" + glyph + "|OmaWrapped")
-      truthy("and says why: " + (sent[0] || [])[5],
-        /^Nothing was recorded for the last 7 days \(.+\)\.$/.test((sent[0] || [])[5] || ""))
-      equal("nothing after the reason", (sent[0] || []).length, 6)
+      // The command says why it failed, over the session bus. The widget
+      // adds nothing: it would have to put the words into arguments.
+      var failed = note(0)
+      equal("the failure is notified once", notifications().length, 1)
+      equal("under the app's name, with its icon",
+        [failed.app, failed.summary, failed.hints["omarchy-glyph"]].join("|"), "OmaWrapped|OmaWrapped|" + glyph)
+      truthy("and says why: " + failed.body, /^Nothing was recorded for the last 7 days \(.+\)\.$/.test(failed.body))
+      equal("the widget itself says nothing", widgetSaid().length, 0)
       // Middle click: Omarchy's menu, here dismissed without a choice.
       widget.handlePress(Qt.MiddleButton)
       equal("the menu does not dim the widget", widget.busy, false)
@@ -135,9 +136,8 @@ ShellRoot {
       widget.handlePress(Qt.MiddleButton)
     }],
     [2500, function() {
-      var sent = notifications()
-      equal("a choice that fails is reported", sent.length, 2)
-      truthy("with the reason: " + (sent[1] || [])[5], /^There is no card yet\./.test((sent[1] || [])[5] || ""))
+      equal("a choice that fails is reported", notifications().length, 2)
+      truthy("with the reason: " + note(1).body, /^There is no card yet\./.test(note(1).body))
       equal("no desktop program was started", lines("started.txt").join(""), "")
       // From here on there is something to draw: a month of sample days.
       sample.running = true
@@ -145,14 +145,13 @@ ShellRoot {
     [1500, function() { widget.handlePress(Qt.LeftButton) }],
     [5000, function() {
       equal("the card is done", widget.busy, false)
-      var sent = notifications()
-      var said = sent[2] || []
-      var card = said[said.length - 1] || ""
-      equal("a drawn card is announced", sent.length, 3)
-      equal("as copied, with the card as its picture", said.slice(4, 7).join("|"), "--image|" + card + "|Card copied")
+      var drawn = note(2)
+      var card = drawn.hints["image-path"] || ""
+      equal("a drawn card is announced", notifications().length, 3)
+      equal("as copied, with the card as its picture", drawn.summary, "Card copied")
       truthy("the card is in the Pictures folder: " + card, /\/home\/Pictures\/omawrapped-\d{4}-\d\d-\d\d\.png$/.test(card))
-      equal("a click on the notification shows it in its folder", said.slice(-4).join("|"),
-        "--exec|" + repo + "/bin/omawrapped|show|" + card)
+      equal("a click on the notification shows it in its folder", drawn.hints["omarchy-exec-argv"],
+        JSON.stringify([repo + "/bin/omawrapped", "show", card]))
       var started = lines("started.txt")
       equal("the picture went to the clipboard", started.indexOf("wl-copy --type image/png") !== -1, true)
       equal("and the card was opened", started.indexOf("xdg-open " + card) !== -1, true)
@@ -168,10 +167,9 @@ ShellRoot {
       widget.handlePress(Qt.MiddleButton)
     }],
     [2500, function() {
-      var sent = notifications()
-      equal("today so far is a notification", sent.length, 4)
-      truthy("with the time as its headline: " + (sent[3] || [])[4], /^Today: \d/.test((sent[3] || [])[4] || ""))
-      truthy("and the top apps under it: " + (sent[3] || [])[5], /^\S.* · \S/.test((sent[3] || [])[5] || ""))
+      equal("today so far is a notification", notifications().length, 4)
+      truthy("with the time as its headline: " + note(3).summary, /^Today: \d/.test(note(3).summary))
+      truthy("and the top apps under it: " + note(3).body, /^\S.* · \S/.test(note(3).body))
       equal("the clipboard is left alone", lines("started.txt").filter(function(line) {
         return line.indexOf("wl-copy") === 0
       }).length, 1)
@@ -183,6 +181,19 @@ ShellRoot {
       equal("the pause is saved as the widget's setting",
         lines("started.txt").indexOf("omarchy-bar set " + pluginId + " paused true --json") !== -1, true)
       equal("with no sampler to follow it, that is all", notifications().length, 4)
+      // Now the desktop takes no notifications, so the command cannot say
+      // why it failed. The widget says that it did, and no more than that.
+      refusal.setText("refuse\n")
+      choice.setText("Today so far\n")
+      widget.handlePress(Qt.MiddleButton)
+    }],
+    [2500, function() {
+      var said = widgetSaid()
+      equal("nothing more reached the desktop", notifications().length, 4)
+      equal("the widget says once that it did not work", said.length, 1)
+      equal("in its own fixed words, and nothing the command printed", (said[0] || []).join("|"),
+        "--app-name|OmaWrapped|-g|" + glyph + "|OmaWrapped|"
+        + "It could not finish. Run `omawrapped status` in a terminal to see why.")
       widget.destroy()
     }]
   ]
@@ -208,11 +219,23 @@ ShellRoot {
     return lines("menu-asked.txt").slice(1).map(function(line) { return line.split("\t")[1] || line })
   }
 
-  // Every notification sent so far, each as its list of arguments.
+  // Every notification that reached the desktop so far, as the stand-in
+  // service of tests/fake_bus.py wrote it down.
   function notifications() {
+    return lines("notifications.jsonl").map(function(line) { return JSON.parse(line) })
+  }
+
+  // One of them, or an empty one, so that a check fails instead of a script.
+  function note(index) {
+    return notifications()[index] || { app: "", summary: "", body: "", hints: {} }
+  }
+
+  // What the widget itself said through Omarchy's notifier, each time as
+  // the list of arguments it started the program with.
+  function widgetSaid() {
     var calls = []
     var call = []
-    var all = lines("notification.txt")
+    var all = lines("widget-said.txt")
     for (var i = 0; i < all.length; i++) {
       if (all[i] === "==") { calls.push(call); call = [] }
       else call.push(all[i])
@@ -223,6 +246,14 @@ ShellRoot {
   FileView {
     id: choice
     path: Quickshell.env("OW_RUN") + "/menu-choice"
+    blockWrites: true
+    printErrors: false
+  }
+
+  // While this file is there, the stand-in notification service refuses.
+  FileView {
+    id: refusal
+    path: Quickshell.env("OW_RUN") + "/notifications.jsonl.refuse"
     blockWrites: true
     printErrors: false
   }

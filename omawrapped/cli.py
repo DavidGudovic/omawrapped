@@ -15,10 +15,17 @@ from . import PLUGIN_ID, VERSION, aggregate, card, gitstats, render, share, stor
 
 # What a click on a notification runs to show a card: this very command, by its absolute path.
 LAUNCHER = Path(__file__).resolve().parent.parent / "bin" / "omawrapped"
+# The exit status of a command that failed and has said why on the desktop itself, so that whoever started it (the
+# widget) does not say it again.
+SAID_ON_DESKTOP = 3
+
+# What _say has said in this run, in order. main() starts it afresh: the tests call main() again and again.
+_said = []
 
 
 def _say(message: str) -> None:
     """Everything but the result goes to stderr, so stdout can be piped."""
+    _said.append(message)
     print(message, file=sys.stderr)
 
 
@@ -176,7 +183,7 @@ def _draw_card(days: int, output=None, copy="path", open_it=False, notify=False,
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.suffix.lower() == ".svg":
-            output.write_text(svg, encoding="utf-8")
+            render.write_svg(svg, output)
         else:
             render.write_png(svg, output)
     except (OSError, render.RenderError) as error:
@@ -209,7 +216,10 @@ def _app_row(name: str, ms: int) -> str:
 
 
 def _today(notify: bool) -> int:
-    """Says how long today has been and which apps it was spent in. The exit status, which is always 0."""
+    """Says how long today has been and which apps it was spent in. The exit status.
+
+    It is 0, or 1 when it was asked to say it on the desktop too and the desktop would not take it.
+    """
     summary, status, ours = _summary(1, None)
     paused = _paused(status, ours)
     counted = summary.total_ms >= ENOUGH_MS
@@ -223,7 +233,10 @@ def _today(notify: bool) -> int:
         body = " · ".join("%s %s" % (name, aggregate.duration(ms)) for name, ms in apps[:3])
         if paused:
             body = body + " · counting is paused" if body else "Counting is paused."
-        share.notify("Today: " + total, body)
+        if not share.notify("Today: " + total, body):
+            _say("Today could not be shown on the desktop: %s. `omawrapped today` in a terminal prints it." % (
+                share.cannot_notify() or "the notification service did not answer"))
+            return 1
     return 0
 
 
@@ -519,9 +532,9 @@ def cmd_status(args) -> int:
         "found" if render.have_renderer() else "MISSING (package librsvg)",
         "Pango" if metrics.exact else "an estimate (python-gobject not available)", metrics.family))
     print("Clipboard wl-copy %s" % ("found" if shutil.which("wl-copy") else "MISSING (package wl-clipboard)"))
-    notifier = next((tool for tool in ("omarchy-notification-send", "notify-send") if shutil.which(tool)), None)
-    print("Notify    %s" % (notifier + " found" if notifier
-                             else "MISSING (no notifications; results are still printed)"))
+    reason = share.cannot_notify()
+    print("Notify    %s" % ("over the session bus" if reason is None
+                             else "MISSING (%s; results are still printed)" % reason))
     print("Menu      %s" % ("omarchy-menu-select found" if shutil.which("omarchy-menu-select")
                            else "MISSING (the widget's middle-click menu needs Omarchy's menu)"))
     print("Pause     %s" % ("omarchy-bar found" if shutil.which("omarchy-bar")
@@ -612,7 +625,8 @@ def parser() -> argparse.ArgumentParser:
     make.add_argument("--copy", choices=("path", "image", "none"), default="path",
                       help="what goes to the clipboard: the file's path (default), the image itself, or nothing")
     make.add_argument("--open", action="store_true", help="open the card when it is done")
-    make.add_argument("--notify", action="store_true", help="say on the desktop that the card is ready")
+    make.add_argument("--notify", action="store_true",
+                      help="say on the desktop that the card is ready, or why it is not")
     make.add_argument("--theme", metavar="DIR",
                       help="take the colours from this theme folder instead of the active theme")
     make.set_defaults(run=cmd_card)
@@ -627,7 +641,8 @@ def parser() -> argparse.ArgumentParser:
                                description="Copy a card's image to the clipboard, to paste into a post or a chat. "
                                            "Without FILE it is the newest card in your Pictures folder.")
     copy.add_argument("file", nargs="?", metavar="FILE", help="the card (default: the newest one)")
-    copy.add_argument("--notify", action="store_true", help="say on the desktop that the card is on the clipboard")
+    copy.add_argument("--notify", action="store_true",
+                      help="say on the desktop that the card is on the clipboard, or why it is not")
     copy.set_defaults(run=cmd_copy)
 
     show = commands.add_parser("show", help="show the last card in the file manager",
@@ -639,12 +654,14 @@ def parser() -> argparse.ArgumentParser:
     pause = commands.add_parser("pause", help="stop counting until you resume",
                                 description="Stop counting screen time until `omawrapped resume`. What is already "
                                             "recorded stays. This sets the widget's paused setting in Omarchy.")
-    pause.add_argument("--notify", action="store_true", help="say on the desktop that counting is paused")
+    pause.add_argument("--notify", action="store_true",
+                       help="say on the desktop that counting is paused, or why it is not")
     pause.set_defaults(run=cmd_pause)
 
     resume = commands.add_parser("resume", help="count again after a pause",
                                  description="Count screen time again after `omawrapped pause`.")
-    resume.add_argument("--notify", action="store_true", help="say on the desktop that counting is back")
+    resume.add_argument("--notify", action="store_true",
+                        help="say on the desktop that counting is back, or why it is not")
     resume.set_defaults(run=cmd_resume)
 
     menu = commands.add_parser("menu", help="pick one of the above from Omarchy's menu (what a middle click on the "
@@ -671,16 +688,27 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def _say_on_desktop() -> bool:
+    """Whether the last thing _say said, its first line, has been said on the desktop as well."""
+    lines = _said[-1].strip().splitlines() if _said else []
+    return bool(lines) and share.notify(share.APP_NAME, lines[0])
+
+
 def main(argv=None) -> int:
     # `omawrapped stats | head` closes the pipe early; end quietly like any
     # other command instead of printing a traceback.
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    _said.clear()
     root = parser()
     args = root.parse_args(argv)
     if not args.command:
         root.print_help()
         return 0
     try:
-        return args.run(args)
+        status = args.run(args)
     except KeyboardInterrupt:
         return 130
+    # A command the desktop started has no terminal for its stderr: a failure is said there too.
+    if status == 1 and (args.command == "menu" or getattr(args, "notify", False)) and _say_on_desktop():
+        return SAID_ON_DESKTOP
+    return status

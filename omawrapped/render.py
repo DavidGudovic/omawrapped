@@ -9,6 +9,7 @@ width of a monospace font is estimated instead.
 import os
 import shutil
 import subprocess
+import tempfile
 import unicodedata
 from pathlib import Path
 
@@ -88,24 +89,48 @@ def have_renderer() -> bool:
     return shutil.which("rsvg-convert") is not None
 
 
-def write_png(svg: str, path: Path) -> None:
-    """Renders svg to a PNG at path, replacing it only once the render is whole."""
-    if not have_renderer():
-        raise RenderError("rsvg-convert was not found. It is part of the librsvg package, which Omarchy ships.")
-    partial = path.with_name(".%s.%d.part" % (path.name, os.getpid()))
+def _write_private(path: Path, data: bytes) -> None:
+    """Writes data to path, replacing what is there only once all of it is written. The file is the user's alone.
+
+    The data goes to a new file next to path first, made by mkstemp: a name nobody can guess, never a file that
+    was there before, and mode 0600 whatever the umask. That file is what replaces path, so a card is never
+    readable by other users, not even for a moment, and never half written.
+    """
+    descriptor, partial = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".part")
     try:
-        done = subprocess.run(
-            ["rsvg-convert", "--format=png", "--output", str(partial)],
-            input=svg.encode("utf-8"), capture_output=True, timeout=60,
-        )
-        if done.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
-            detail = done.stderr.decode("utf-8", "replace").strip().splitlines()
-            raise RenderError("rsvg-convert could not render the card" + (": " + detail[-1] if detail else "."))
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
         os.replace(partial, path)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise RenderError("The card could not be written to %s: %s" % (path, error)) from error
     finally:
+        # Gone already when it was moved into place; otherwise nothing may be left behind.
         try:
-            partial.unlink()
+            os.unlink(partial)
         except OSError:
             pass
+
+
+def write_png(svg: str, path: Path) -> None:
+    """Renders svg to a PNG at path, replacing it only once the render is whole.
+
+    The drawing goes to rsvg-convert on its standard input and the picture comes back on its standard output, so
+    that no path, which says where the user keeps things, is among the arguments that every user can read.
+    """
+    if not have_renderer():
+        raise RenderError("rsvg-convert was not found. It is part of the librsvg package, which Omarchy ships.")
+    try:
+        done = subprocess.run(["rsvg-convert", "--format=png"], input=svg.encode("utf-8"), capture_output=True,
+                              timeout=60)
+        if done.returncode != 0 or not done.stdout:
+            detail = done.stderr.decode("utf-8", "replace").strip().splitlines()
+            raise RenderError("rsvg-convert could not render the card" + (": " + detail[-1] if detail else "."))
+        _write_private(path, done.stdout)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RenderError("The card could not be written to %s: %s" % (path, error)) from error
+
+
+def write_svg(svg: str, path: Path) -> None:
+    """Saves the drawing itself at path, replacing it only once it is whole."""
+    try:
+        _write_private(path, svg.encode("utf-8"))
+    except OSError as error:
+        raise RenderError("The card could not be written to %s: %s" % (path, error)) from error

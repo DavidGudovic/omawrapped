@@ -4,6 +4,7 @@ import os
 import shutil
 import stat
 import struct
+import subprocess
 import unittest
 import xml.etree.ElementTree as ET
 from collections import Counter, namedtuple
@@ -13,7 +14,7 @@ from unittest import mock
 
 from omawrapped import aggregate, card, render, system
 from omawrapped.store import Day
-from support import SAMPLE_END, IsolatedCase, clock, sample_days, sample_summary
+from support import SAMPLE_END, IsolatedCase, StubbedCase, clock, sample_days, sample_summary
 
 SVG = "{http://www.w3.org/2000/svg}"
 THEMES = Path("/usr/share/omarchy/themes")
@@ -720,8 +721,12 @@ class WritePngWithoutRendererTests(IsolatedCase):
         self.assertEqual(os.listdir(out), [])
 
 
+def mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
 @unittest.skipUnless(shutil.which("rsvg-convert"), "rsvg-convert is not installed")
-class WritePngTests(IsolatedCase):
+class WritePngTests(StubbedCase):
     def setUp(self):
         super().setUp()
         metrics = render.Metrics("monospace")
@@ -763,8 +768,10 @@ class WritePngTests(IsolatedCase):
         self.assertEqual(os.listdir(self.out), ["card.png"])
 
     def test_a_missing_folder_is_a_render_error(self):
-        with self.assertRaises(render.RenderError):
+        with self.assertRaises(render.RenderError) as caught:
             render.write_png(self.svg, self.out / "no-such-folder" / "card.png")
+        self.assertIn("The card could not be written to %s" % (self.out / "no-such-folder" / "card.png"),
+                      str(caught.exception))
         self.assertEqual(os.listdir(self.out), [])
 
     @unittest.skipIf(os.geteuid() == 0, "root can write into any folder")
@@ -773,14 +780,239 @@ class WritePngTests(IsolatedCase):
         locked.mkdir()
         locked.chmod(stat.S_IRUSR | stat.S_IXUSR)
         self.addCleanup(locked.chmod, stat.S_IRWXU)
-        with self.assertRaises(render.RenderError):
+        with self.assertRaises(render.RenderError) as caught:
             render.write_png(self.svg, locked / "card.png")
+        self.assertIn("The card could not be written to %s" % (locked / "card.png"), str(caught.exception))
         self.assertEqual(os.listdir(locked), [])
 
     def test_a_path_may_have_spaces_and_other_characters(self):
         path = self.out / "my card (1) é.png"
         render.write_png(self.svg, path)
         self.assertEqual(path.read_bytes()[:8], PNG_SIGNATURE)
+        self.assertEqual(os.listdir(self.out), [path.name])
+
+    # ---- what rsvg-convert is started with ----
+
+    def test_rsvg_convert_is_started_with_exactly_format_png(self):
+        # The drawing goes in on its standard input and the picture comes back on its standard output: a path in
+        # its arguments could be read by every user of the machine.
+        self.stubs.spy("rsvg-convert")
+        path = self.out / "secret-client card.png"
+        render.write_png(self.svg, path)
+        self.assertEqual(self.stubs.argv("rsvg-convert"), [["--format=png"]])
+        # It drew what it was given, so the drawing did reach it.
+        self.assertEqual(struct.unpack(">II", path.read_bytes()[16:24]), (1600, 900))
+
+    # ---- the file is the user's alone ----
+
+    def test_the_card_is_readable_by_nobody_else_whatever_the_umask(self):
+        for mask in (0o022, 0o000, 0o077):
+            with self.subTest(umask=oct(mask)):
+                self.set_umask(mask)
+                path = self.out / ("card-%03o.png" % mask)
+                render.write_png(self.svg, path)
+                self.assertEqual(mode(path), 0o600)
+
+    def test_a_card_that_replaces_a_world_readable_file_is_not_readable_by_the_world(self):
+        path = self.write(self.out / "card.png", "old")
+        path.chmod(0o644)
+        for mask in (0o022, 0o000):
+            with self.subTest(umask=oct(mask)):
+                self.set_umask(mask)
+                path.chmod(0o644)
+                render.write_png(self.svg, path)
+                self.assertEqual(path.read_bytes()[:8], PNG_SIGNATURE)
+                self.assertEqual(mode(path), 0o600)
+
+    def test_the_file_is_private_while_it_is_written_not_only_afterwards(self):
+        # It is made with its mode and moved into place: there is no moment when it is open to others.
+        self.set_umask(0o000)
+        seen = []
+        replace = os.replace
+
+        def looking(source, target):
+            seen.append((Path(source).name, mode(Path(source)), Path(source).parent))
+            replace(source, target)
+
+        with mock.patch.object(render.os, "replace", looking):
+            render.write_png(self.svg, self.out / "card.png")
+        self.assertEqual(len(seen), 1)
+        name, permissions, folder = seen[0]
+        self.assertEqual((permissions, folder), (0o600, self.out))
+        self.assertTrue(name.startswith(".card.png.") and name.endswith(".part"), name)
+
+    def test_the_temporary_file_has_a_name_that_nobody_can_guess_and_is_new(self):
+        names = []
+        mkstemp = render.tempfile.mkstemp
+
+        def watching(**options):
+            descriptor, name = mkstemp(**options)
+            names.append((options, Path(name).name))
+            return descriptor, name
+
+        with mock.patch.object(render.tempfile, "mkstemp", watching):
+            render.write_png(self.svg, self.out / "card.png")
+            render.write_png(self.svg, self.out / "card.png")
+        self.assertEqual([options for options, _ in names],
+                         [{"dir": self.out, "prefix": ".card.png.", "suffix": ".part"}] * 2)
+        self.assertNotEqual(names[0][1], names[1][1])
+        for _, name in names:
+            self.assertNotIn(str(os.getpid()), name)
+
+    def test_a_link_left_at_the_name_the_file_used_to_have_leads_nowhere(self):
+        # The temporary file used to be named after the process: a link planted there led the write to any file.
+        victim = self.write(self.tmp / "victim.txt", "precious")
+        trap = self.out / (".card.png.%d.part" % os.getpid())
+        trap.symlink_to(victim)
+        render.write_png(self.svg, self.out / "card.png")
+        self.assertEqual(victim.read_text(encoding="utf-8"), "precious")
+        self.assertEqual((self.out / "card.png").read_bytes()[:8], PNG_SIGNATURE)
+        self.assertTrue(trap.is_symlink())
+
+    # ---- a render that fails leaves the folder and the old card alone ----
+
+    def assert_failed_and_untouched(self, message):
+        path = self.write(self.out / "card.png", "precious")
+        path.chmod(0o644)
+        with self.assertRaises(render.RenderError) as caught:
+            render.write_png(self.svg, path)
+        self.assertEqual(str(caught.exception), message)
+        self.assertEqual(path.read_text(encoding="utf-8"), "precious")
+        self.assertEqual(mode(path), 0o644)
+        self.assertEqual(os.listdir(self.out), ["card.png"])
+        self.assertEqual(self.stubs.argv("rsvg-convert"), [["--format=png"]])
+
+    def test_a_renderer_that_fails_says_why_and_leaves_no_file_and_the_old_card_untouched(self):
+        self.stubs.replace_tool("rsvg-convert")
+        self.stubs.fail("rsvg-convert", 1, reason="Could not parse the drawing\nline 3: boom")
+        self.assert_failed_and_untouched("rsvg-convert could not render the card: line 3: boom")
+
+    def test_a_renderer_that_fails_without_a_word_is_still_an_error(self):
+        self.stubs.replace_tool("rsvg-convert")
+        self.stubs.fail("rsvg-convert", 2)
+        self.assert_failed_and_untouched("rsvg-convert could not render the card.")
+
+    def test_a_renderer_that_prints_nothing_is_an_error_too(self):
+        # The stand-in exits 0 and writes nothing: no picture is no card.
+        self.stubs.replace_tool("rsvg-convert")
+        self.assert_failed_and_untouched("rsvg-convert could not render the card.")
+
+    def test_a_renderer_that_cannot_be_started_or_hangs_is_an_error_that_names_the_file(self):
+        path = self.write(self.out / "card.png", "precious")
+        for error in (PermissionError("denied"), subprocess.TimeoutExpired("rsvg-convert", 60)):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(render.subprocess, "run", side_effect=error):
+                    with self.assertRaises(render.RenderError) as caught:
+                        render.write_png(self.svg, path)
+                self.assertTrue(str(caught.exception).startswith("The card could not be written to %s: " % path))
+                self.assertEqual(path.read_text(encoding="utf-8"), "precious")
+                self.assertEqual(os.listdir(self.out), ["card.png"])
+
+    def test_a_file_that_cannot_be_moved_into_place_is_an_error_and_leaves_no_file(self):
+        path = self.write(self.out / "card.png", "precious")
+        with mock.patch.object(render.os, "replace", side_effect=PermissionError("denied")):
+            with self.assertRaises(render.RenderError) as caught:
+                render.write_png(self.svg, path)
+        self.assertEqual(str(caught.exception), "The card could not be written to %s: denied" % path)
+        self.assertEqual(path.read_text(encoding="utf-8"), "precious")
+        self.assertEqual(os.listdir(self.out), ["card.png"])
+
+    def test_a_write_that_runs_out_of_room_is_an_error_and_leaves_no_file(self):
+        path = self.write(self.out / "card.png", "precious")
+        handle = mock.MagicMock()
+        handle.__enter__.return_value.write.side_effect = OSError(28, "No space left on device")
+        with mock.patch.object(render.os, "fdopen", return_value=handle):
+            with self.assertRaises(render.RenderError) as caught:
+                render.write_png(self.svg, path)
+        self.assertIn("No space left on device", str(caught.exception))
+        self.assertEqual(path.read_text(encoding="utf-8"), "precious")
+        self.assertEqual([name for name in os.listdir(self.out) if name.endswith(".part")], [])
+
+    def test_an_interrupt_leaves_no_file_either(self):
+        path = self.out / "card.png"
+        with mock.patch.object(render.os, "replace", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                render.write_png(self.svg, path)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_a_folder_in_the_way_is_an_error_and_leaves_no_file(self):
+        (self.out / "card.png").mkdir()
+        with self.assertRaises(render.RenderError):
+            render.write_png(self.svg, self.out / "card.png")
+        self.assertEqual(os.listdir(self.out), ["card.png"])
+
+
+class WriteSvgTests(IsolatedCase):
+    SVG = "<svg xmlns='http://www.w3.org/2000/svg'><text>Caf\u00e9 \u2192 \U0001f600</text></svg>"
+
+    def setUp(self):
+        super().setUp()
+        self.out = self.tmp / "out"
+        self.out.mkdir()
+
+    def test_writes_the_drawing_as_it_is_in_utf8(self):
+        path = self.out / "card.svg"
+        render.write_svg(self.SVG, path)
+        self.assertEqual(path.read_bytes(), self.SVG.encode("utf-8"))
+        self.assertEqual(os.listdir(self.out), ["card.svg"])
+
+    def test_the_drawing_of_a_whole_card_is_written_whole(self):
+        metrics = render.Metrics("monospace")
+        svg = card.build(sample_summary(7), card.Facts("Matte Black", 3, "3.5.2", 12, 2), system.Theme(), metrics)
+        render.write_svg(svg, self.out / "card.svg")
+        self.assertEqual(ET.parse(self.out / "card.svg").getroot().tag, SVG + "svg")
+        self.assertEqual((self.out / "card.svg").read_text(encoding="utf-8"), svg)
+
+    def test_the_card_is_readable_by_nobody_else_whatever_the_umask(self):
+        for mask in (0o022, 0o000, 0o077):
+            with self.subTest(umask=oct(mask)):
+                self.set_umask(mask)
+                path = self.out / ("card-%03o.svg" % mask)
+                render.write_svg(self.SVG, path)
+                self.assertEqual(mode(path), 0o600)
+
+    def test_a_card_that_replaces_a_world_readable_file_is_not_readable_by_the_world(self):
+        path = self.write(self.out / "card.svg", "old")
+        path.chmod(0o644)
+        self.set_umask(0o022)
+        render.write_svg(self.SVG, path)
+        self.assertEqual(path.read_text(encoding="utf-8"), self.SVG)
+        self.assertEqual(mode(path), 0o600)
+        self.assertEqual(os.listdir(self.out), ["card.svg"])
+
+    def test_a_missing_folder_is_a_render_error_that_names_the_file(self):
+        path = self.out / "no-such-folder" / "card.svg"
+        with self.assertRaises(render.RenderError) as caught:
+            render.write_svg(self.SVG, path)
+        self.assertTrue(str(caught.exception).startswith("The card could not be written to %s: " % path))
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_a_file_that_cannot_be_moved_into_place_leaves_no_file_and_the_old_card_untouched(self):
+        path = self.write(self.out / "card.svg", "precious")
+        with mock.patch.object(render.os, "replace", side_effect=PermissionError("denied")):
+            with self.assertRaises(render.RenderError) as caught:
+                render.write_svg(self.SVG, path)
+        self.assertEqual(str(caught.exception), "The card could not be written to %s: denied" % path)
+        self.assertEqual(path.read_text(encoding="utf-8"), "precious")
+        self.assertEqual(os.listdir(self.out), ["card.svg"])
+
+    def test_the_temporary_file_is_made_the_same_way_as_for_a_png(self):
+        names = []
+        mkstemp = render.tempfile.mkstemp
+
+        def watching(**options):
+            names.append(options)
+            return mkstemp(**options)
+
+        with mock.patch.object(render.tempfile, "mkstemp", watching):
+            render.write_svg(self.SVG, self.out / "card.svg")
+        self.assertEqual(names, [{"dir": self.out, "prefix": ".card.svg.", "suffix": ".part"}])
+
+    def test_no_program_is_started(self):
+        with mock.patch.object(render.subprocess, "run") as ran:
+            with mock.patch.object(render.subprocess, "Popen") as started:
+                render.write_svg(self.SVG, self.out / "card.svg")
+        self.assertEqual((ran.call_count, started.call_count), (0, 0))
 
 
 if __name__ == "__main__":

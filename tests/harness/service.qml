@@ -162,8 +162,12 @@ ShellRoot {
       near("todayMs follows the disk", service.todayMs, 1300)
       equal("not paused unless the setting says so", JSON.parse(service.statusJson()).paused, false)
       // The user pauses: the setting arrives, and counting stops with it.
-      harness.beforePause = day ? day.active_ms : 0
+      // What was counted up to that moment is written at once, so that the
+      // next look can ask for the very same number.
       service.shell = shellWith({ paused: true })
+      service.flush()
+      var atPause = readDay()
+      harness.beforePause = atPause ? atPause.active_ms : 0
     }],
     [1000, function() {
       service.flush()

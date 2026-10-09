@@ -15,7 +15,10 @@ import "Tracker.js" as Tracker
 //   middle click  Omarchy's menu: today so far, the last card, a pause
 //
 // A card is opened, put on the clipboard as a picture and announced by the
-// command itself. Only what goes wrong is reported from here.
+// command itself, and so is the reason when it fails. Nothing the command
+// printed is passed on from here: a notification sent from the widget goes
+// through a program's arguments, which every user of the machine can read,
+// so it only ever says one of two fixed sentences.
 BarWidget {
   id: root
   moduleName: "io.github.davidgudovic.omawrapped"
@@ -44,9 +47,15 @@ BarWidget {
     return today + " of screen time today · click: week card · right: month card · middle: more"
   }
 
-  function report(problem) {
+  // What the widget itself can say, word for word.
+  readonly property string notFinished: "It could not finish. Run `omawrapped status` in a terminal to see why."
+  readonly property string notStarted: "The omawrapped command could not be started."
+  // The command's exit status when it has said on the desktop why it failed.
+  readonly property int saidItself: 3
+
+  function report(sentence) {
     Quickshell.execDetached(["omarchy-notification-send", "--app-name", "OmaWrapped", "-g", root.glyph,
-      "OmaWrapped", problem])
+      "OmaWrapped", sentence])
   }
 
   function handlePress(button) {
@@ -71,17 +80,16 @@ BarWidget {
       running = true
     }
 
-    stderr: StdioCollector { id: errors; waitForEnd: true }
-    // The first line the command printed says why it failed.
+    // A command that failed has normally said why itself. This is for the
+    // one that could not: no notification service, or a broken install.
     onExited: function(exitCode) {
       pending = false
-      var said = String(errors.text || "").trim().split("\n")[0]
-      if (exitCode !== 0) root.report(said || "Run `omawrapped` in a terminal to see why.")
+      if (exitCode !== 0 && exitCode !== root.saidItself) root.report(root.notFinished)
     }
     // A command that cannot be started never exits; it only stops running.
     onRunningChanged: if (!running && pending) {
       pending = false
-      root.report("The omawrapped command could not be started.")
+      root.report(root.notStarted)
     }
   }
 

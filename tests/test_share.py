@@ -10,9 +10,8 @@ from pathlib import Path
 from unittest import mock
 
 from omawrapped import share
-from support import STUBBED, StubbedCase, Stubs
+from support import GLYPH, STUBBED, Bus, IsolatedCase, StubbedCase, Stubs, notification, real_tool
 
-GLYPH = "\U000f154d"
 COPY_FAILED = "wl-copy could not copy the card. Is a Wayland session running?"
 NO_WL_COPY = "wl-copy was not found (package wl-clipboard), so nothing was copied."
 NO_MENU = ("omarchy-menu-select was not found, so there is no menu to show. "
@@ -145,14 +144,37 @@ class CopyTests(ShareCase):
         share.copy_image(path)
         self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "image/png"]])
 
-    def test_copy_path_runs_wl_copy_with_the_path_after_two_dashes(self):
+    def test_copy_path_runs_wl_copy_with_the_text_type_and_the_path_on_stdin(self):
         share.copy_path(Path("/some folder/omawrapped-2026-10-09.png"))
-        self.assertEqual(self.stubs.argv("wl-copy"), [["--", "/some folder/omawrapped-2026-10-09.png"]])
-        self.assertEqual(self.stubs.stdin("wl-copy"), b"")
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "text/plain"]])
+        # The path, byte for byte: not a newline after it, as echo would add.
+        self.assertEqual(self.stubs.stdin("wl-copy"), b"/some folder/omawrapped-2026-10-09.png")
+
+    def test_the_path_is_not_among_the_arguments_of_wl_copy(self):
+        # What a program is started with can be read by every user of the machine: the path goes in on stdin.
+        share.copy_path(Path("/home/me/secret-client/omawrapped-2026-10-09.png"))
+        self.assertEqual([argument for call in self.stubs.argv("wl-copy") for argument in call],
+                         ["--type", "text/plain"])
 
     def test_a_path_that_looks_like_an_option_is_still_a_path(self):
         share.copy_path(Path("-n"))
-        self.assertEqual(self.stubs.argv("wl-copy"), [["--", "-n"]])
+        self.assertEqual(self.stubs.argv("wl-copy"), [["--type", "text/plain"]])
+        self.assertEqual(self.stubs.stdin("wl-copy"), b"-n")
+
+    def test_a_path_of_any_characters_arrives_as_it_is(self):
+        # Spaces at the ends, a newline, a tab, characters of every size, and a name that is not text at all.
+        names = ["/a/ spaced name /c.png", "/a/line\nbreak\tand tab.png", "/a/\u00e9\u2192\U0001f600.png",
+                 os.fsdecode(b"/a/not-utf8-\xff.png")]
+        for name in names:
+            with self.subTest(name=name):
+                share.copy_path(Path(name))
+                self.assertEqual(self.stubs.stdin("wl-copy"), os.fsencode(name))
+
+    def test_a_path_that_cannot_be_encoded_is_an_error_and_wl_copy_is_not_started(self):
+        with self.assertRaises(share.ShareError) as caught:
+            share.copy_path(Path("/a/\ud83d.png"))
+        self.assertEqual(str(caught.exception), COPY_FAILED)
+        self.assertEqual(self.stubs.argv("wl-copy"), [])
 
     def test_a_missing_wl_copy_is_an_error_with_the_package_to_install(self):
         self.stubs.remove("wl-copy")
@@ -187,8 +209,9 @@ class CopyTests(ShareCase):
                 share.copy_path(Path("/x.png"))
         self.assertEqual(str(caught.exception), COPY_FAILED)
 
-    def test_wl_copy_gets_10_seconds_and_no_pipe_of_ours(self):
-        # wl-copy stays behind to serve the clipboard: a pipe it inherited would never be closed.
+    def test_wl_copy_gets_10_seconds_and_nothing_to_read_from_us_but_its_input(self):
+        # wl-copy stays behind to serve the clipboard: a pipe of ours that it inherited for its output would never
+        # be closed. What it reads is written to it and the pipe is closed again before it is waited for.
         run = self.spied("run")
         path = self.card("omawrapped-2026-10-09.png")
         share.copy_image(path)
@@ -200,7 +223,9 @@ class CopyTests(ShareCase):
             self.assertEqual(call.kwargs["stderr"], subprocess.DEVNULL)
             self.assertNotIn("capture_output", call.kwargs)
             self.assertNotEqual(call.kwargs.get("stdin"), subprocess.PIPE)
-        self.assertEqual(run.call_args_list[1].kwargs["stdin"], subprocess.DEVNULL)
+        self.assertNotIn("input", run.call_args_list[0].kwargs)
+        self.assertEqual(run.call_args_list[1].kwargs["input"], str(path).encode("utf-8"))
+        self.assertNotIn("stdin", run.call_args_list[1].kwargs)
 
     def test_a_file_that_cannot_be_read_is_an_error_and_wl_copy_is_not_started(self):
         with self.assertRaises(share.ShareError) as caught:
@@ -218,6 +243,8 @@ class CopyTests(ShareCase):
         for _ in range(5):
             with self.assertRaises(share.ShareError):
                 share.copy_image(path)
+            with self.assertRaises(share.ShareError):
+                share.copy_path(path)
         self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
 
@@ -303,93 +330,282 @@ class ShowInFolderTests(DetachedCase):
 
 
 class NotifyTests(ShareCase):
+    """notify() sends the notification itself, over the session bus. The bus here is the test's own."""
+
+    needs_bus = True
     CLICK = ["/plugin/bin/omawrapped", "show", "/pictures/omawrapped-2026-10-09.png"]
     IMAGE = Path("/pictures/omawrapped-2026-10-09.png")
 
+    def setUp(self):
+        super().setUp()
+        self.use_bus()
+
     def sent(self) -> list:
-        return self.stubs.argv("omarchy-notification-send")
+        return self.bus.notifications()
+
+    def assert_no_program_started(self):
+        for name, calls in self.stubs.everything().items():
+            self.assertEqual(calls, [], "%s was started" % name)
 
     def test_the_headline_and_the_body_are_all_it_needs(self):
-        self.assertTrue(share.notify("Card saved", "It is in Pictures."))
-        self.assertEqual(self.sent(), [["--app-name", "OmaWrapped", "-g", GLYPH, "Card saved", "It is in Pictures."]])
+        self.assertIs(share.notify("Card saved", "It is in Pictures."), True)
+        self.assertEqual(self.sent(), [notification("Card saved", "It is in Pictures.")])
+
+    def test_what_arrives_is_what_omarchys_own_tool_sends(self):
+        share.notify("Card saved", "It is in Pictures.")
+        self.assertEqual(self.sent(), [{
+            "app": "OmaWrapped", "replaces": 0, "icon": "", "summary": "Card saved", "body": "It is in Pictures.",
+            "actions": [], "hints": {"urgency": 0, "omarchy-glyph": "\U000f154d"}, "expire": -1}])
 
     def test_the_body_may_be_left_out(self):
-        self.assertTrue(share.notify("Card saved"))
-        self.assertEqual(self.sent(), [["--app-name", "OmaWrapped", "-g", GLYPH, "Card saved", ""]])
+        self.assertIs(share.notify("Card saved"), True)
+        self.assertEqual(self.sent(), [notification("Card saved", "")])
 
-    def test_an_image_comes_before_the_text(self):
+    def test_an_image_is_a_hint(self):
         share.notify("Card copied", "Paste it.", image=self.IMAGE)
-        self.assertEqual(self.sent(), [["--app-name", "OmaWrapped", "-g", GLYPH, "--image", str(self.IMAGE),
-                                        "Card copied", "Paste it."]])
+        self.assertEqual(self.sent()[0]["hints"], {"urgency": 0, "omarchy-glyph": GLYPH,
+                                                    "image-path": "/pictures/omawrapped-2026-10-09.png"})
+        # The icon of the notification itself stays empty: the shell takes it from the glyph.
+        self.assertEqual(self.sent()[0]["icon"], "")
 
-    def test_a_click_command_comes_last_after_exec(self):
+    def test_a_click_command_is_a_json_array_of_its_words(self):
         share.notify("Card saved", "Click it.", click=self.CLICK)
-        self.assertEqual(self.sent(), [["--app-name", "OmaWrapped", "-g", GLYPH, "Card saved", "Click it.",
-                                        "--exec", *self.CLICK]])
+        self.assertEqual(self.sent()[0]["hints"]["omarchy-exec-argv"],
+                         '["/plugin/bin/omawrapped","show","/pictures/omawrapped-2026-10-09.png"]')
+        self.assertEqual(self.sent(), [notification("Card saved", "Click it.", click=self.CLICK)])
+
+    def test_the_click_command_is_compact_json(self):
+        share.notify("x", click=["a", "b c"])
+        self.assertEqual(self.sent()[0]["hints"]["omarchy-exec-argv"], '["a","b c"]')
+
+    def test_a_click_command_with_spaces_and_quotes_keeps_every_word_whole(self):
+        words = ['say "hi"', "back\\slash", Path("/b folder/c.png"), "é→", "tab\there", ""]
+        share.notify("x", click=words)
+        hint = self.sent()[0]["hints"]["omarchy-exec-argv"]
+        self.assertEqual(hint, r'["say \"hi\"","back\\slash","/b folder/c.png","é→","tab\there",""]')
+        self.assertEqual(json.loads(hint), [str(word) for word in words])
 
     def test_image_and_click_together(self):
         share.notify("Card copied", "Paste it. Click it.", image=self.IMAGE, click=self.CLICK)
-        argv = self.sent()[0]
-        self.assertEqual(argv, ["--app-name", "OmaWrapped", "-g", GLYPH, "--image", str(self.IMAGE),
-                                "Card copied", "Paste it. Click it.", "--exec", *self.CLICK])
-        self.assertEqual(argv[argv.index("--exec"):], ["--exec", *self.CLICK])
+        self.assertEqual(self.sent(), [notification("Card copied", "Paste it. Click it.", image=self.IMAGE,
+                                                    click=self.CLICK)])
+        self.assertEqual(set(self.sent()[0]["hints"]), {"urgency", "omarchy-glyph", "image-path", "omarchy-exec-argv"})
 
-    def test_the_click_command_is_passed_word_by_word(self):
-        share.notify("Card saved", "x", click=["/a folder/omawrapped", "show", Path("/b folder/c.png")])
-        self.assertEqual(self.sent()[0][-4:], ["--exec", "/a folder/omawrapped", "show", "/b folder/c.png"])
+    def test_a_click_command_that_is_empty_is_no_hint(self):
+        share.notify("x", click=[])
+        self.assertEqual(set(self.sent()[0]["hints"]), {"urgency", "omarchy-glyph"})
 
-    def test_a_headline_with_a_tab_and_a_newline_arrives_unchanged(self):
+    def test_urgency_is_low_and_the_glyph_is_there_whatever_else_is_given(self):
+        share.notify("a")
+        share.notify("b", "c", image=self.IMAGE)
+        share.notify("d", "e", click=self.CLICK)
+        share.notify("f", "g", image=self.IMAGE, click=self.CLICK)
+        self.assertEqual(len(self.sent()), 4)
+        for sent in self.sent():
+            self.assertEqual((sent["hints"]["urgency"], sent["hints"]["omarchy-glyph"]), (0, GLYPH))
+            self.assertEqual((sent["app"], sent["expire"], sent["replaces"], sent["actions"]),
+                             ("OmaWrapped", -1, 0, []))
+
+    def test_each_notification_is_one_of_its_own(self):
+        share.notify("one")
+        share.notify("two")
+        self.assertEqual([sent["summary"] for sent in self.sent()], ["one", "two"])
+
+    def test_text_arrives_unchanged_a_tab_a_newline_and_characters_of_every_size(self):
         share.notify("a\tb", "c\nd")
-        self.assertEqual(self.sent()[0][-2:], ["a\tb", "c\nd"])
+        share.notify("T\u00e2che \u2713 \U0001f600 \U000f154d", "\u00b7 \u2014 \u00e9")
+        self.assertEqual([(sent["summary"], sent["body"]) for sent in self.sent()],
+                         [("a\tb", "c\nd"), ("T\u00e2che \u2713 \U0001f600 \U000f154d", "\u00b7 \u2014 \u00e9")])
 
-    def test_without_omarchys_tool_notify_send_is_used(self):
-        self.stubs.remove("omarchy-notification-send")
-        self.assertTrue(share.notify("Card saved", "Click it.", image=self.IMAGE, click=self.CLICK))
-        self.assertEqual(self.stubs.argv("notify-send"),
-                         [["-a", "OmaWrapped", "-i", str(self.IMAGE), "Card saved", "Click it."]])
-
-    def test_notify_send_without_an_image(self):
-        self.stubs.remove("omarchy-notification-send")
-        share.notify("Card saved", "Click it.", click=self.CLICK)
-        self.assertEqual(self.stubs.argv("notify-send"), [["-a", "OmaWrapped", "Card saved", "Click it."]])
-
-    def test_omarchys_tool_is_preferred_when_both_exist(self):
-        share.notify("Card saved", "x")
+    def test_it_starts_no_program_at_all(self):
+        # Not omarchy-notification-send, not notify-send: what they would be given is readable by every user.
+        popen, run = mock.patch.object(share.subprocess, "Popen"), mock.patch.object(share.subprocess, "run")
+        with popen as started, run as ran:
+            self.assertIs(share.notify("Today: 3h 07m", "Ghostty 1h 20m", image=self.IMAGE, click=self.CLICK), True)
+        self.assertEqual((started.call_count, ran.call_count), (0, 0))
+        self.assert_no_program_started()
         self.assertEqual(len(self.sent()), 1)
-        self.assertEqual(self.stubs.argv("notify-send"), [])
 
-    def test_with_neither_it_is_false_and_nothing_is_said(self):
+    def test_it_needs_neither_of_the_programs_that_used_to_send_it(self):
         self.stubs.remove("omarchy-notification-send", "notify-send")
-        self.assertIs(share.notify("Card saved", "x", image=self.IMAGE, click=self.CLICK), False)
-
-    def test_a_tool_that_fails_gives_false(self):
-        self.stubs.fail("omarchy-notification-send", 1)
-        self.assertIs(share.notify("Card saved", "x"), False)
+        self.assertIs(share.notify("Card saved", "x"), True)
         self.assertEqual(len(self.sent()), 1)
-        # Omarchy's tool was the one asked; its failure is not a reason to say it twice.
-        self.assertEqual(self.stubs.argv("notify-send"), [])
 
-    def test_a_failing_notify_send_gives_false(self):
-        self.stubs.remove("omarchy-notification-send")
-        self.stubs.fail("notify-send", 1)
-        self.assertIs(share.notify("Card saved", "x"), False)
+    def test_the_connection_is_closed_again(self):
+        share.notify("warm up")
+        before = len(os.listdir("/proc/self/fd"))
+        for _ in range(10):
+            share.notify("Card saved", "x")
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
-    def test_a_tool_that_hangs_or_cannot_be_started_gives_false(self):
-        for error in (subprocess.TimeoutExpired("omarchy-notification-send", 10), PermissionError("denied")):
+    # ---- no notification: False, and nothing started ----
+
+    def no_address(self, **env) -> None:
+        """For the rest of the test, no session bus is named, and none is found under XDG_RUNTIME_DIR."""
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
+
+    def assert_false_and_nothing_started(self, headline="Card saved", **kwargs):
+        with mock.patch.object(share.subprocess, "Popen") as started, mock.patch.object(share.subprocess, "run") as ran:
+            self.assertIs(share.notify(headline, "x", **kwargs), False)
+        self.assertEqual((started.call_count, ran.call_count), (0, 0))
+        self.assert_no_program_started()
+        self.assertEqual(self.sent(), [])
+
+    def test_without_a_bus_address_it_is_false_and_nothing_is_started(self):
+        self.no_address()
+        self.assert_false_and_nothing_started(image=self.IMAGE, click=self.CLICK)
+
+    def test_an_empty_bus_address_is_none(self):
+        self.no_address(DBUS_SESSION_BUS_ADDRESS="")
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = ""
+        self.assert_false_and_nothing_started()
+
+    def test_a_dead_address_is_false_and_nothing_is_started(self):
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=%s" % (self.tmp / "run" / "no-bus")
+        self.assert_false_and_nothing_started()
+
+    def test_an_address_that_is_no_address_is_false(self):
+        for address in ("nonsense", "unix:", "tcp:host=127.0.0.1,port=1"):
+            with self.subTest(address=address):
+                os.environ["DBUS_SESSION_BUS_ADDRESS"] = address
+                self.assert_false_and_nothing_started()
+
+    def test_without_python_gobject_it_is_false_and_nothing_is_started(self):
+        for error in (ImportError("No module named 'gi'"), ValueError("Namespace Gio not available")):
             with self.subTest(error=type(error).__name__):
-                with mock.patch.object(share.subprocess, "run", side_effect=error):
-                    self.assertIs(share.notify("Card saved", "x"), False)
+                with mock.patch.object(share, "_gio", side_effect=error):
+                    self.assert_false_and_nothing_started()
 
-    def test_the_tool_gets_10_seconds_and_nothing_to_write_to(self):
-        run = self.spied("run")
-        share.notify("Card saved", "x")
-        kwargs = run.call_args.kwargs
-        self.assertEqual(kwargs["timeout"], 10)
-        for stream in ("stdin", "stdout", "stderr"):
-            self.assertEqual(kwargs[stream], subprocess.DEVNULL)
+    def test_a_service_that_refuses_gives_false_and_the_next_one_goes_through(self):
+        self.bus.refuse(True)
+        self.assert_false_and_nothing_started(click=self.CLICK)
+        self.bus.refuse(False)
+        self.assertIs(share.notify("Card saved", "x"), True)
+        self.assertEqual(len(self.sent()), 1)
+
+    def test_a_headline_that_cannot_be_encoded_is_false_with_nothing_started(self):
+        # Half a character, such as a lone surrogate, cannot be sent as text.
+        self.assert_false_and_nothing_started("\ud83d")
+
+    def test_other_text_that_cannot_be_encoded_gives_false_and_the_next_one_goes_through(self):
+        for fields in ({"body": "half \ud83d"}, {"image": Path("/a/\ud83d.png")}, {"click": ["/a", "\ud83d"]}):
+            with self.subTest(fields=sorted(fields)):
+                self.assertIs(share.notify("ok", **fields), False)
+        self.assertEqual(self.sent(), [])
+        self.assertIs(share.notify("Card saved", "x"), True)
+        self.assertEqual(len(self.sent()), 1)
 
     def test_the_glyph_is_the_chart_box_of_the_nerd_font(self):
         self.assertEqual(share.GLYPH, "\U000f154d")
+
+    def test_the_app_is_called_omawrapped(self):
+        self.assertEqual(share.APP_NAME, "OmaWrapped")
+
+
+class CannotNotifyTests(ShareCase):
+    """cannot_notify() says why no notification can be sent, without sending one."""
+
+    needs_bus = True
+
+    def setUp(self):
+        super().setUp()
+        self.use_bus()
+
+    def no_address(self):
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
+
+    def test_none_when_a_notification_can_be_sent(self):
+        self.assertIsNone(share.cannot_notify())
+
+    def test_none_for_an_address_that_has_not_been_tried(self):
+        # It is a look at what is there, not a connection.
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=%s" % (self.tmp / "run" / "no-bus")
+        self.assertIsNone(share.cannot_notify())
+
+    def test_without_python_gobject(self):
+        for error in (ImportError("No module named 'gi'"), ValueError("Namespace Gio not available")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(share, "_gio", side_effect=error):
+                    self.assertEqual(share.cannot_notify(), "python-gobject is not installed")
+
+    def test_without_a_session_bus(self):
+        self.no_address()
+        self.assertEqual(share.cannot_notify(), "there is no session bus")
+
+    def test_python_gobject_is_named_before_the_bus_when_both_are_missing(self):
+        self.no_address()
+        with mock.patch.object(share, "_gio", side_effect=ImportError):
+            self.assertEqual(share.cannot_notify(), "python-gobject is not installed")
+
+    def test_it_sends_nothing_and_starts_nothing(self):
+        with mock.patch.object(share.subprocess, "Popen") as started, mock.patch.object(share.subprocess, "run") as ran:
+            share.cannot_notify()
+        self.assertEqual((started.call_count, ran.call_count), (0, 0))
+        self.assertEqual(self.bus.notifications(), [])
+
+
+class BusAddressTests(ShareCase):
+    """Where the session bus is: the environment says, else the socket in the runtime folder, if it is there."""
+
+    needs_bus = True
+
+    def setUp(self):
+        super().setUp()
+        self.run_dir = self.tmp / "run"
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
+
+    def test_the_variable_comes_first(self):
+        (self.run_dir / "bus").write_text("", encoding="utf-8")
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/elsewhere"
+        self.assertEqual(share._bus_address(), "unix:path=/elsewhere")
+
+    def test_the_socket_in_the_runtime_folder_is_used_when_it_is_there(self):
+        (self.run_dir / "bus").write_text("", encoding="utf-8")
+        self.assertEqual(share._bus_address(), "unix:path=%s/bus" % self.run_dir)
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = ""
+        self.assertEqual(share._bus_address(), "unix:path=%s/bus" % self.run_dir)
+
+    def test_a_socket_that_is_not_there_is_not_guessed(self):
+        self.assertFalse((self.run_dir / "bus").exists())
+        self.assertIsNone(share._bus_address())
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = ""
+        self.assertIsNone(share._bus_address())
+
+    def test_an_address_that_asks_for_a_bus_to_be_started_is_not_one(self):
+        # "autolaunch:" would have a bus started for the command; it only ever uses one that is there.
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = "autolaunch:"
+        self.assertIsNone(share._bus_address())
+        self.assertIs(share.notify("Card saved", "x"), False)
+        (self.run_dir / "bus").write_text("", encoding="utf-8")
+        self.assertEqual(share._bus_address(), "unix:path=%s/bus" % self.run_dir)
+
+    def test_without_a_runtime_folder_there_is_none(self):
+        del os.environ["XDG_RUNTIME_DIR"]
+        self.assertIsNone(share._bus_address())
+        os.environ["XDG_RUNTIME_DIR"] = ""
+        self.assertIsNone(share._bus_address())
+
+    def test_a_notification_finds_the_bus_through_the_runtime_folder(self):
+        # The socket of the test bus, linked in where a session puts its own.
+        socket = self.bus.address.split("=", 1)[1].split(",")[0]
+        (self.run_dir / "bus").symlink_to(socket)
+        self.assertIs(share.notify("Card saved", "x"), True)
+        self.assertEqual(self.bus.notifications(), [notification("Card saved", "x")])
+
+    def test_no_session_is_started_for_a_machine_without_one(self):
+        # A bus is never started from here: with no address and no socket, that is the end of it.
+        with mock.patch.object(share.subprocess, "Popen") as started, mock.patch.object(share.subprocess, "run") as ran:
+            self.assertIs(share.notify("Card saved", "x"), False)
+        self.assertEqual((started.call_count, ran.call_count), (0, 0))
 
 
 class ChooseTests(ShareCase):
@@ -578,10 +794,139 @@ class StandInTests(ShareCase):
         done = subprocess.run([menu, "p", "a"], capture_output=True, text=True, env={})
         self.assertEqual((done.returncode, done.stdout), (0, "Copy card\n"))
 
+    def test_a_spy_logs_the_call_and_the_folder_and_runs_the_real_program(self):
+        self.stubs.spy("git")
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        done = subprocess.run(["git", "--version"], capture_output=True, text=True, cwd=elsewhere, env=os.environ)
+        self.assertEqual(done.returncode, 0)
+        self.assertTrue(done.stdout.startswith("git version"), done.stdout)
+        self.assertEqual(self.stubs.argv("git"), [["--version"]])
+        self.assertEqual(self.stubs.cwds("git"), [str(elsewhere)])
+        self.assertEqual(shutil.which("git"), str(self.stubs.tools / "git"))
+
+    def test_a_spy_hands_on_every_argument_and_the_standard_input_unchanged(self):
+        if not real_tool("rsvg-convert") or not real_tool("fc-match"):
+            self.skipTest("rsvg-convert and fc-match are needed")
+        self.stubs.spy("rsvg-convert")
+        self.stubs.spy("fc-match")
+        svg = b"<svg xmlns='http://www.w3.org/2000/svg' width='3' height='2'><rect width='3' height='2'/></svg>"
+        done = subprocess.run(["rsvg-convert", "--format=png"], input=svg, capture_output=True, env=os.environ)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout[:8], b"\x89PNG\r\n\x1a\n")
+        done = subprocess.run(["fc-match", "-f", "%{family[0]} \u00e9", "monospace"], capture_output=True,
+                              env=os.environ)
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(self.stubs.argv("rsvg-convert"), [["--format=png"]])
+        self.assertEqual(self.stubs.argv("fc-match"), [["-f", "%{family[0]} \u00e9", "monospace"]])
+
+    def test_only_the_harmless_tools_can_be_spied_on(self):
+        for name in STUBBED:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    self.stubs.spy(name)
+
+    def test_a_spy_replaces_the_link_to_the_real_tool_and_a_stand_in_can_take_its_place_again(self):
+        self.stubs.spy("git")
+        self.assertFalse((self.stubs.tools / "git").is_symlink())
+        self.stubs.replace_tool("git")
+        subprocess.run(["git", "status"], check=True, env=os.environ)
+        self.assertEqual(self.stubs.argv("git"), [["status"]])
+        self.assertEqual(self.stubs.cwds("git"), [])
+
+    def test_everything_started_is_listed_by_program(self):
+        self.stubs.spy("git")
+        self.assertEqual(self.stubs.everything(), {})
+        subprocess.run([str(self.stubs.dir / "xdg-open"), "a"], check=True, env={})
+        subprocess.run(["git", "--version"], check=True, capture_output=True, env=os.environ)
+        subprocess.run([str(self.stubs.dir / "xdg-open"), "b"], check=True, env={})
+        self.assertEqual(self.stubs.everything(), {"git": [["--version"]], "xdg-open": [["a"], ["b"]]})
+
     def test_the_log_is_json_one_call_a_line(self):
         subprocess.run([str(self.stubs.dir / "notify-send"), "a\nb"], check=True, env={})
         lines = (self.stubs.logs / "notify-send.log").read_text(encoding="utf-8").splitlines()
         self.assertEqual([json.loads(line) for line in lines], [["a\nb"]])
+
+
+class BusTests(IsolatedCase):
+    """The test bus is what keeps a notification of the tests off the real desktop, so it is tested too."""
+
+    needs_bus = True
+
+    def test_it_is_a_bus_of_its_own(self):
+        self.assertTrue(self.bus.address.startswith("unix:path=/"), self.bus.address)
+        self.assertTrue(Path(self.bus.address.split("=", 1)[1].split(",")[0]).exists())
+        self.assertIsNone(self.bus.process.poll())
+        self.assertNotEqual(self.bus.address, os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
+
+    def test_it_knows_nothing_of_the_environment_of_the_tests(self):
+        environment = Path("/proc/%d/environ" % self.bus.process.pid).read_bytes().split(b"\0")
+        names = sorted(item.split(b"=")[0].decode() for item in environment if item)
+        self.assertEqual(names, ["HOME", "PATH", "TMPDIR", "XDG_RUNTIME_DIR"])
+        self.assertIn(b"PATH=/usr/bin", environment)
+
+    def test_what_it_is_sent_is_listed_oldest_first_and_cleared_on_request(self):
+        self.use_bus()
+        self.assertEqual(self.bus.notifications(), [])
+        share.notify("one", "1")
+        share.notify("two", "2")
+        self.assertEqual([sent["summary"] for sent in self.bus.notifications()], ["one", "two"])
+        self.bus.clear()
+        self.assertEqual(self.bus.notifications(), [])
+        share.notify("three", "3")
+        self.assertEqual([sent["summary"] for sent in self.bus.notifications()], ["three"])
+
+    def test_it_can_be_made_to_refuse_and_to_take_notifications_again(self):
+        self.use_bus()
+        self.bus.refuse(True)
+        self.assertIs(share.notify("one"), False)
+        self.bus.refuse(False)
+        self.assertIs(share.notify("two"), True)
+        self.assertEqual([sent["summary"] for sent in self.bus.notifications()], ["two"])
+
+    def test_resetting_clears_what_was_said_and_stops_refusing(self):
+        self.use_bus()
+        self.bus.refuse(True)
+        self.bus.reset()
+        share.notify("one")
+        self.bus.reset()
+        self.assertEqual(self.bus.notifications(), [])
+        self.assertIs(share.notify("two"), True)
+
+    def test_each_test_starts_with_nothing_said_and_nothing_refused(self):
+        # The test case clears the bus before every test: whatever an earlier test left is gone.
+        self.assertEqual(self.bus.notifications(), [])
+        self.assertFalse(Path(str(self.bus.log) + ".refuse").exists())
+        self.use_bus()
+        share.notify("left behind, and the next test must not see it")
+        self.bus.refuse(True)
+
+    def test_stopping_ends_that_process_and_removes_its_folder(self):
+        bus = Bus()
+        pid, folder = bus.process.pid, bus.log.parent
+        self.assertTrue(folder.is_dir())
+        bus.stop()
+        self.assertIsNotNone(bus.process.poll())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertFalse(folder.exists())
+        bus.stop()
+        self.assertIsNone(self.bus.process.poll())
+
+    def test_a_bus_that_does_not_start_is_an_error_and_leaves_nothing_running(self):
+        started = []
+        real = subprocess.Popen
+
+        def not_the_bus(command, **options):
+            process = real(["/usr/bin/false"], **options)
+            started.append(process)
+            return process
+
+        with mock.patch.object(subprocess, "Popen", not_the_bus):
+            with self.assertRaises(RuntimeError):
+                Bus()
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll())
 
 
 if __name__ == "__main__":
