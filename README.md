@@ -4,10 +4,14 @@ Your week on [Omarchy](https://omarchy.org/) as one card you can post: how long 
 
 ![An OmaWrapped card for the last 7 days](preview.png)
 
+<img src="docs/bar-widget.png" alt="The OmaWrapped bar widget: a chart icon and 3h 07m" width="188">
+
+The widget as the bar draws it, enlarged.
+
 OmaWrapped is a plugin for the Omarchy shell. It has two parts:
 
-- **A bar widget** that shows today's screen time. Click it for a card of the last 7 days, right click for the last 30.
-- **An `omawrapped` command** that draws the card, prints the numbers behind it, and wipes the data.
+- **A bar widget** that shows today's screen time. Click it for a card of the last 7 days, right click for the last 30. The card is opened, put on the clipboard as a picture and announced. A middle click offers to copy the last card again or show it in its folder.
+- **An `omawrapped` command** that draws the card, copies or shows it, prints the numbers behind it, and wipes the data.
 
 Everything is counted on your machine and stays there. OmaWrapped makes no network requests, and it never looks at window titles. See [Privacy](#privacy) for exactly what is stored.
 
@@ -39,8 +43,11 @@ Everything below ships with Omarchy, so there is normally nothing to add. `omawr
 | `python` 3.11 or later | the `omawrapped` command | no card; the widget still counts |
 | `librsvg` (`rsvg-convert`) | turning the drawing into a PNG | `omawrapped card -o card.svg` still works |
 | `python-gobject` with Pango | measuring text so nothing overflows | widths are estimated for a monospace font |
-| `wl-clipboard` (`wl-copy`) | copying the card's path | the path is only printed |
+| `wl-clipboard` (`wl-copy`) | copying the card or its path | nothing is copied; the card is still saved |
 | `xdg-utils` (`xdg-open`) | opening the card after a click | the card is saved but not opened |
+| `omarchy-notification-send` (part of Omarchy; `notify-send` otherwise) | saying that the card is ready | nothing is announced |
+| `omarchy-menu-select` (part of Omarchy) | the middle-click menu | no menu; `omawrapped copy` and `omawrapped show` still work |
+| `nautilus` | showing the card in its folder | the folder is opened with `xdg-open`, the card not selected |
 | `git` | counting your commits | the card has no commit count |
 | `fontconfig` (`fc-match`) | finding your monospace font | the generic `monospace` is used |
 
@@ -52,6 +59,9 @@ Click the widget, or:
 omawrapped card              # last 7 days -> ~/Pictures/omawrapped-2026-10-09.png, path copied
 omawrapped card --month      # last 30 days -> ~/Pictures/omawrapped-2026-10-09-month.png
 omawrapped card --days 14    # any number of days, today included
+omawrapped copy              # the last card's picture -> clipboard
+omawrapped show              # the last card, selected in the file manager
+omawrapped menu              # the same choices in Omarchy's menu (what a middle click does)
 omawrapped stats             # the same numbers as text; add --json for scripts
 omawrapped status            # what is stored, whether the sampler runs, what it ignores, what is installed
 omawrapped reset             # delete everything that was recorded
@@ -64,11 +74,31 @@ Options for `card`:
 | `-o FILE` | Save somewhere else. A name ending in `.svg` saves the drawing itself. |
 | `--copy path\|image\|none` | Put the file's path on the clipboard (default), the image itself (paste it straight into a post), or nothing. |
 | `--open` | Open the card when it is done. |
+| `--notify` | Say on the desktop that the card is ready. Clicking the notification shows the card in its folder. |
 | `--exclude APP` | Leave an app out of the app list, by name or window class. Repeatable. Its time still counts as screen time. |
 | `--repos DIR` | Look for git repositories here instead of the configured folders. Repeatable. |
 | `--theme DIR` | Take the colours from another theme folder, for example `/usr/share/omarchy/themes/nord`. |
 
 The card's file name carries the date of its last day, so making the same card twice in a day replaces the first.
+
+### Sharing a card
+
+A left or right click on the widget draws the card and does four things at once. It saves the card to the Pictures folder, opens it in the image viewer, puts the picture on the clipboard, ready to paste into a post, and shows a notification titled "Card copied" with the card as its picture. Clicking the notification shows the card in its folder.
+
+A middle click opens Omarchy's own menu:
+
+- **Copy card**
+- **Show in folder**
+- **Card of the last 7 days**
+- **Card of the last 30 days**
+
+"Copy card" and "Show in folder" act on the newest card in the Pictures folder. If there is none yet, a notification says so.
+
+From a terminal, `omawrapped copy` copies the last card, `omawrapped show` shows it in its folder, and `omawrapped menu` opens the same menu. `omawrapped card` run from a terminal copies the card's path by default; `--copy image` copies the picture instead, and `--notify` announces it.
+
+If a tool is missing, the command names it and carries on. Without `wl-copy`, nothing is copied, but the card is still saved and opened. Without Nautilus, "Show in folder" opens the folder without selecting the card. Without Omarchy's menu, a middle click reports that; `omawrapped copy` and `omawrapped show` still work.
+
+There is no screenshot of the menu or the notification here: the Omarchy shell draws both, so they need a running desktop to capture.
 
 ### Settings
 
@@ -103,6 +133,18 @@ omarchy bar set io.github.davidgudovic.omawrapped countKeptAwake false
 | Theme, plugins, Omarchy version | Read from Omarchy's own files when the card is drawn. |
 
 Terminal commands are not counted. Bash keeps no time with its history by default, so a count for a period could not be trusted, and reading the history at all is more than a recap card should do.
+
+## More pictures
+
+![The card for the last 30 days](docs/card-month.png)
+
+The last 30 days, in the Matte Black theme.
+
+![The card in a light theme](docs/card-light.png)
+
+The last 7 days in Catppuccin Latte: the card takes its colours from whichever theme is active.
+
+Every picture in this README is real output. `tests/screenshots.sh` draws them from the code in a temporary home: the cards with the `omawrapped` command from the sample days of `tests/make_sample.py`, the widget from `BarWidget.qml` with a stand-in for the bar around it. None of them shows anyone's real data.
 
 ## How it counts, and what that costs
 
@@ -142,6 +184,8 @@ An app is named by its window class, such as `chromium` or `com.mitchellh.ghostt
 **Where it is.** `~/.local/share/omawrapped/days/`, one `YYYY-MM-DD.json` per day, in a folder only your user can open (mode 700; the service makes it so again if the folder is ever deleted and recreated). Nothing is stored anywhere else, and nothing is ever sent anywhere: the plugin contains no network code.
 
 **What drawing a card reads.** The day files; `git log` in your own repositories (commit ids, author dates and author e-mails, to count yours; never messages or contents, and nothing is fetched); the colours and name of your theme; the number of folders in `~/.config/omarchy/plugins`; its own settings in `shell.json`; and the names in your `.desktop` files, to show "Files" instead of `org.gnome.Nautilus`. All of it read-only.
+
+**Sharing.** Copying a card puts the picture on your clipboard, and Omarchy's clipboard history keeps it like anything else you copy. Nothing is uploaded or sent anywhere: posting the card is something you do yourself.
 
 **Keeping an app out.** Add its window class to `ignoreApps` and it is no longer recorded: time in it does not count at all. Capitals do not matter, and a web app is matched by its site whatever page it is on. An ignored app is also left off cards for days recorded before you ignored it, though its earlier time stays in those days' files until you reset. `omawrapped status` shows what is being ignored. To keep an app off one card only, use `omawrapped card --exclude`.
 
@@ -187,6 +231,7 @@ To pause instead, `omarchy plugin disable io.github.davidgudovic.omawrapped` sto
 
 ```bash
 tests/check.sh               # everything: accounting, command, manifest, service and widget, all headless
+tests/screenshots.sh         # redraw the pictures in this README from the code, in a temporary home
 tests/live.sh 300            # run the real sampler against your session for 5 minutes, without installing
 tests/live.sh 300 /tmp/ow    # the same, keeping what it recorded: XDG_DATA_HOME=/tmp/ow bin/omawrapped stats
 tests/make_sample.py /tmp/ow --repos && XDG_DATA_HOME=/tmp/ow/data bin/omawrapped card --repos /tmp/ow/repos -o /tmp/ow/card.png
