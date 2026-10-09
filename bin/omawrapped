@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+"""OmaWrapped's command line. Run `omawrapped --help`."""
+
+import os
+import sys
+
+# This file lives in a plugin folder, and the shell reloads every plugin
+# when a file appears in one. Python must not leave bytecode beside it.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from omawrapped.cli import main  # noqa: E402
+
+sys.exit(main())
