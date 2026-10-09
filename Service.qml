@@ -11,9 +11,9 @@ import "Tracker.js" as Tracker
 // time in memory for at most a minute, and then adds it to one small file
 // per day under ~/.local/share/omawrapped/days/.
 //
-// It starts no process while it runs, opens no window, sends no
-// notification and makes no network request. Only the focused window's app
-// id is read; its title is never looked at.
+// Apart from creating its data folder once at start, it runs no program.
+// It opens no window, sends no notification and makes no network request.
+// Only the focused window's app id is read; its title is never looked at.
 //
 // The files are the truth and memory holds only what was not written yet:
 // every flush reads the day back, adds to it and replaces it. That is what
@@ -27,7 +27,6 @@ Item {
   // The host's facade: null before it is injected and again once the plugin
   // is disabled. Only the bar configuration is read from it.
   property var shell: null
-  property var manifest: null
 
   readonly property string pluginId: "io.github.davidgudovic.omawrapped"
 
@@ -35,6 +34,9 @@ Item {
 
   readonly property var entry: Tracker.entryFor(shell ? shell.barConfig : null, pluginId)
   readonly property int idleSeconds: boundedInt(entry.idleSeconds, 120, 30, 3600)
+  // A playing video or a call keeps the session from going idle. That is
+  // screen time, unless the user says otherwise.
+  readonly property bool countKeptAwake: entry.countKeptAwake !== false && entry.countKeptAwake !== "false"
   // The screensaver is a window like any other, and nobody is watching it.
   readonly property var ignoredApps: ["org.omarchy.screensaver"].concat(Tracker.parseList(entry.ignoreApps))
 
@@ -189,13 +191,22 @@ Item {
       idle: userIdle,
       locked: sessionLocked,
       idleSeconds: idleSeconds,
+      countKeptAwake: countKeptAwake,
       todayMs: Math.round(todayMs),
       dataDir: dataDir
     })
   }
 
-  onFocusedAppChanged: observe()
-  onUserIdleChanged: observe()
+  // Locking and unlocking move the focus and wake the idle timer, so those
+  // two are also the moments to ask about the lock. The tick asks as well,
+  // in case a lock ever comes without either.
+  function sessionChanged() {
+    observe()
+    if (pollLock) lockProbe.restart()
+  }
+
+  onFocusedAppChanged: sessionChanged()
+  onUserIdleChanged: sessionChanged()
   onSessionLockedChanged: observe()
   onIgnoredAppsChanged: observe()
 
@@ -206,12 +217,11 @@ Item {
     id: idleMonitor
     enabled: true
     timeout: root.idleSeconds
-    // A playing video keeps the session from going idle; it then counts.
-    respectInhibitors: true
+    respectInhibitors: root.countKeptAwake
   }
 
-  // The data directory is private to the user. Only this one process is
-  // ever started, once; the day files are written by the shell itself.
+  // The data directory is private to the user. This is the only program
+  // the service ever runs; the day files are written by the shell itself.
   Process {
     id: prepare
     command: ["mkdir", "-p", "-m", "700", root.dataDir]
@@ -229,6 +239,14 @@ Item {
     repeat: true
     running: true
     onTriggered: root.tick()
+  }
+
+  // One question for a burst of changes: focus often moves several times
+  // within a millisecond.
+  Timer {
+    id: lockProbe
+    interval: 50
+    onTriggered: Hyprland.refreshMonitors()
   }
 
   // The shell is closing: write what the last minute collected.

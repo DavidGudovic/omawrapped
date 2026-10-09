@@ -18,6 +18,7 @@
     "defaults": {
       "display": "time",
       "idleSeconds": 120,
+      "countKeptAwake": true,
       "ignoreApps": "",
       "repoDirs": "~/projects, ~/code"
     },
@@ -38,7 +39,14 @@
         "max": 3600,
         "step": 30,
         "defaultValue": 120,
-        "description": "Time stops counting once you have not touched the keyboard or mouse for this long. A playing video keeps it counting."
+        "description": "Time stops counting once you have not touched the keyboard or mouse for this long."
+      },
+      {
+        "key": "countKeptAwake",
+        "type": "boolean",
+        "label": "Count while a video or call keeps the screen awake",
+        "defaultValue": true,
+        "description": "On: watching a video or sitting in a call counts as screen time even without input. Off: only keyboard and mouse activity counts."
       },
       {
         "key": "ignoreApps",

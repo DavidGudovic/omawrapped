@@ -15,6 +15,10 @@
 var VERSION = 1
 var MAX_APPS_PER_DAY = 256
 var MAX_APP_LENGTH = 96
+// How long an app must hold focus before moving to it counts as a switch.
+// Focus passes over windows all the time without anyone switching: when a
+// workspace changes, a window closes, or the screensaver starts.
+var SWITCH_DWELL_MS = 1000
 
 function emptyDay(date) {
   var hours = []
@@ -83,9 +87,24 @@ function addInterval(days, startMs, endMs, app) {
 }
 
 // cursor is where the open stretch began; app and counting describe it.
-// lastApp is the last named app that was counted, for the switch counter.
+// For the switch counter: runApp has had focus for runMs of counted time
+// in a row, and lastApp is the app the user was last settled in.
 function create() {
-  return { days: {}, cursor: null, app: "", counting: false, lastApp: "" }
+  return { days: {}, cursor: null, app: "", counting: false, lastApp: "", runApp: "", runMs: 0 }
+}
+
+// Counts a switch once the app of the stretch just closed has held focus
+// for SWITCH_DWELL_MS and is not the app the user was settled in before.
+function noteRun(state, nowMs, elapsed) {
+  if (!state.app) return
+  if (state.runApp !== state.app) {
+    state.runApp = state.app
+    state.runMs = 0
+  }
+  state.runMs += elapsed
+  if (state.runMs < SWITCH_DWELL_MS || state.runApp === state.lastApp) return
+  if (state.lastApp) dayFor(state.days, dateKey(nowMs)).switches += 1
+  state.lastApp = state.runApp
 }
 
 // Closes the open stretch at nowMs under the conditions it was opened with,
@@ -95,15 +114,13 @@ function create() {
 function observe(state, nowMs, app, away, maxGapMs) {
   if (state.cursor !== null && state.counting) {
     var elapsed = nowMs - state.cursor
-    if (elapsed > 0 && elapsed <= maxGapMs) addInterval(state.days, state.cursor, nowMs, state.app)
-  }
-  var id = cleanApp(app)
-  if (!away && id && id !== state.lastApp) {
-    if (state.lastApp) dayFor(state.days, dateKey(nowMs)).switches += 1
-    state.lastApp = id
+    if (elapsed > 0 && elapsed <= maxGapMs) {
+      addInterval(state.days, state.cursor, nowMs, state.app)
+      noteRun(state, nowMs, elapsed)
+    }
   }
   state.cursor = nowMs
-  state.app = id
+  state.app = cleanApp(app)
   state.counting = !away
 }
 
@@ -201,8 +218,16 @@ function parseList(value) {
 
 // The plugin's entry in the bar layout, or {} while it has none. Services
 // are not handed their settings, only the bar configuration they live in.
+// That configuration reaches a plugin with its lists in a form that is not
+// an array, so it is first taken through JSON, which makes them arrays.
 function entryFor(barConfig, id) {
-  var layout = barConfig && typeof barConfig === "object" ? barConfig.layout : null
+  var config
+  try {
+    config = JSON.parse(JSON.stringify(barConfig))
+  } catch (error) {
+    return {}
+  }
+  var layout = config && typeof config === "object" ? config.layout : null
   if (!layout || typeof layout !== "object") return {}
   var sections = ["left", "center", "right"]
   for (var s = 0; s < sections.length; s++) {

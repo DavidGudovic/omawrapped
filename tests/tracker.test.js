@@ -99,7 +99,7 @@ describe("environment", () => {
   test("runs in Europe/Belgrade and the loader exposes the library", () => {
     assert.equal(new Date(2026, 0, 15, 12).getTimezoneOffset(), -60)
     assert.equal(new Date(2026, 6, 15, 12).getTimezoneOffset(), -120)
-    for (const name of ["VERSION", "MAX_APPS_PER_DAY", "MAX_APP_LENGTH"]) {
+    for (const name of ["VERSION", "MAX_APPS_PER_DAY", "MAX_APP_LENGTH", "SWITCH_DWELL_MS"]) {
       assert.equal(typeof tracker[name], "number", name)
     }
     for (const name of ["emptyDay", "dateKey", "nextHourStart", "cleanApp", "addInterval", "create", "observe",
@@ -315,11 +315,12 @@ describe("observe", () => {
       [40 * SEC, "b", true],
       [50 * SEC, "b"],
       [60 * SEC, "c"],
+      [70 * SEC, "c"],
     ])
     const day = pending(state)
-    assert.equal(day.active_ms, 40 * SEC)
-    assert.deepEqual(plain(day.apps_ms), { a: 20 * SEC, b: 20 * SEC })
-    assert.deepEqual(plain(day.hours_ms), hoursWith({ 10: 40 * SEC }))
+    assert.equal(day.active_ms, 50 * SEC)
+    assert.deepEqual(plain(day.apps_ms), { a: 20 * SEC, b: 20 * SEC, c: 10 * SEC })
+    assert.deepEqual(plain(day.hours_ms), hoursWith({ 10: 50 * SEC }))
     assert.equal(day.switches, 2)
   })
 
@@ -395,9 +396,59 @@ describe("observe", () => {
   })
 
   test("switches counts a change between two different named apps", () => {
-    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "b"]])), 1)
-    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "b"], [20 * SEC, "a"]])), 2)
+    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "b"], [20 * SEC, "b"]])), 1)
+    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "b"], [20 * SEC, "a"], [30 * SEC, "a"]])), 2)
     assert.equal(switchCount(run([[0, "a"], [10 * SEC, "a"], [20 * SEC, "a"]])), 0)
+  })
+
+  test("a switch counts once the new app has held focus for the dwell time", () => {
+    const dwell = tracker.SWITCH_DWELL_MS
+    assert.equal(dwell, 1000)
+    // not yet: the stretch in b is still open
+    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "b"]])), 0)
+    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "b"], [10 * SEC + dwell - 1, "b"]])), 0)
+    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "b"], [10 * SEC + dwell, "b"]])), 1)
+    // reached over two stretches in a row, as when a tick falls in between
+    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "b"], [10 * SEC + 400, "b"], [10 * SEC + 1100, "b"]])), 1)
+  })
+
+  test("focus that only passes over an app is not a switch", () => {
+    const state = run([[0, "a"], [10 * SEC, "b"], [10 * SEC + 300, "a"], [20 * SEC, "a"]])
+    assert.equal(switchCount(state), 0)
+    // the time it had focus is still its time
+    assert.deepEqual(plain(pending(state).apps_ms), { a: 10 * SEC + 9700, b: 300 })
+    // a -> b (in passing) -> c is one switch, to c
+    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "b"], [10 * SEC + 500, "c"], [20 * SEC, "c"]])), 1)
+  })
+
+  test("two short visits with another app in between do not add up to a switch", () => {
+    const state = run([[0, "a"], [10 * SEC, "b"], [10 * SEC + 600, "c"], [10 * SEC + 700, "b"],
+      [10 * SEC + 1300, "a"], [20 * SEC, "a"]])
+    assert.equal(switchCount(state), 0)
+  })
+
+  test("the screensaver starting does not count switches", () => {
+    // What a live session shows when the screensaver starts: the user has
+    // been away, focus hops over two windows within milliseconds, and the
+    // screensaver (ignored, so away) takes over.
+    const state = run([
+      [0, "claude"],
+      [30 * SEC, "claude", true],
+      [103 * SEC, "", true],
+      [103 * SEC + 1, "slack", true],
+      [103 * SEC + 2, "slack"],
+      [103 * SEC + 10, ""],
+      [103 * SEC + 11, "org.omarchy.screensaver", true],
+      [103 * SEC + 12, "", true],
+      [103 * SEC + 13, "claude"],
+      [103 * SEC + 20, ""],
+      [103 * SEC + 21, "org.omarchy.screensaver", true],
+      [133 * SEC, "org.omarchy.screensaver", true],
+    ], 5 * MIN)
+    const day = pending(state)
+    assert.equal(day.switches, 0)
+    assert.equal(day.apps_ms.claude, 30 * SEC + 7)
+    assert.equal(day.apps_ms.slack, 8)
   })
 
   test("going away and returning to the same app is not a switch", () => {
@@ -412,25 +463,26 @@ describe("observe", () => {
   })
 
   test("an empty app in between does not hide a real switch", () => {
-    assert.equal(switchCount(run([[0, "a"], [10 * SEC, ""], [20 * SEC, "b"]])), 1)
+    assert.equal(switchCount(run([[0, "a"], [10 * SEC, ""], [20 * SEC, "b"], [30 * SEC, "b"]])), 1)
   })
 
   test("returning from away into a different app is a switch", () => {
-    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "a", true], [20 * SEC, "b"]])), 1)
+    assert.equal(switchCount(run([[0, "a"], [10 * SEC, "a", true], [20 * SEC, "b"], [30 * SEC, "b"]])), 1)
   })
 
   test("a switch is recorded on the day it happens", () => {
     const state = tracker.create()
     tracker.observe(state, at(2026, 5, 14, 23, 59, 50), "a", false, GAP)
     tracker.observe(state, at(2026, 5, 15, 0, 0, 5), "b", false, GAP)
+    tracker.observe(state, at(2026, 5, 15, 0, 0, 15), "b", false, GAP)
     const first = pending(state, "2026-05-14")
     const second = pending(state, "2026-05-15")
     assert.equal(first.active_ms, 10 * SEC)
     assert.deepEqual(plain(first.hours_ms), hoursWith({ 23: 10 * SEC }))
     assert.equal(first.switches, 0)
-    assert.equal(second.active_ms, 5 * SEC)
-    assert.deepEqual(plain(second.hours_ms), hoursWith({ 0: 5 * SEC }))
-    assert.deepEqual(plain(second.apps_ms), { a: 5 * SEC })
+    assert.equal(second.active_ms, 15 * SEC)
+    assert.deepEqual(plain(second.hours_ms), hoursWith({ 0: 15 * SEC }))
+    assert.deepEqual(plain(second.apps_ms), { a: 5 * SEC, b: 10 * SEC })
     assert.equal(second.switches, 1)
   })
 
@@ -440,9 +492,10 @@ describe("observe", () => {
       [10 * SEC, "fire\x00fox\x07"],
       [20 * SEC, "\tfirefox\n"],
       [30 * SEC, "kitty"],
+      [40 * SEC, "kitty"],
     ])
     const day = pending(state)
-    assert.deepEqual(plain(day.apps_ms), { firefox: 30 * SEC })
+    assert.deepEqual(plain(day.apps_ms), { firefox: 30 * SEC, kitty: 10 * SEC })
     assert.equal(day.switches, 1, "only the final change to kitty is a switch")
   })
 
@@ -484,12 +537,12 @@ describe("observe", () => {
 
 describe("takePending, restorePending, pendingDay", () => {
   test("takePending hands over the counted days and leaves none pending", () => {
-    const state = run([[0, "a"], [10 * SEC, "a"], [20 * SEC, "b"]])
+    const state = run([[0, "a"], [10 * SEC, "b"], [20 * SEC, "b"]])
     const taken = tracker.takePending(state)
     assert.deepEqual(Object.keys(taken), [DATE])
     assert.equal(taken[DATE].date, DATE)
     assert.equal(taken[DATE].active_ms, 20 * SEC)
-    assert.deepEqual(plain(taken[DATE].apps_ms), { a: 20 * SEC })
+    assert.deepEqual(plain(taken[DATE].apps_ms), { a: 10 * SEC, b: 10 * SEC })
     assert.equal(taken[DATE].switches, 1)
     assert.deepEqual(Object.keys(state.days), [])
     assert.equal(pending(state), null)
@@ -533,7 +586,7 @@ describe("takePending, restorePending, pendingDay", () => {
   })
 
   test("a day with only a switch in it is returned", () => {
-    const state = run([[0, "a"], [10 * SEC, "b"]])
+    const state = run([[0, "a"], [10 * SEC, "b"], [20 * SEC, "b"]])
     state.days[DATE].active_ms = 0
     state.days[DATE].hours_ms = hoursWith({})
     state.days[DATE].apps_ms = {}
@@ -555,11 +608,12 @@ describe("takePending, restorePending, pendingDay", () => {
     const taken = tracker.takePending(state)[DATE]
     tracker.observe(state, BASE + 25 * SEC, "a", false, GAP)
     tracker.observe(state, BASE + 30 * SEC, "b", false, GAP)
+    tracker.observe(state, BASE + 40 * SEC, "b", false, GAP)
     tracker.restorePending(state, taken)
     const day = pending(state)
-    assert.equal(day.active_ms, 30 * SEC)
-    assert.deepEqual(plain(day.hours_ms), hoursWith({ 10: 30 * SEC }))
-    assert.deepEqual(plain(day.apps_ms), { a: 30 * SEC })
+    assert.equal(day.active_ms, 40 * SEC)
+    assert.deepEqual(plain(day.hours_ms), hoursWith({ 10: 40 * SEC }))
+    assert.deepEqual(plain(day.apps_ms), { a: 30 * SEC, b: 10 * SEC })
     assert.equal(day.switches, 1)
   })
 
@@ -911,11 +965,11 @@ describe("entryFor", () => {
     const left = { layout: { left: [{ id: "clock" }, { id: "me", where: "left" }], center: [], right: [] } }
     const center = { layout: { left: [], center: [{ id: "me", where: "center" }], right: [] } }
     const right = { layout: { left: [], center: [], right: [{ id: "x" }, { id: "me", where: "right" }] } }
-    assert.equal(tracker.entryFor(left, "me"), left.layout.left[1])
-    assert.equal(tracker.entryFor(center, "me"), center.layout.center[0])
-    assert.equal(tracker.entryFor(right, "me"), right.layout.right[1])
+    assert.deepEqual(plain(tracker.entryFor(left, "me")), left.layout.left[1])
+    assert.deepEqual(plain(tracker.entryFor(center, "me")), center.layout.center[0])
+    assert.deepEqual(plain(tracker.entryFor(right, "me")), right.layout.right[1])
     const full = config()
-    assert.equal(tracker.entryFor(full, "omawrapped"), full.layout.center[1])
+    assert.deepEqual(plain(tracker.entryFor(full, "omawrapped")), full.layout.center[1])
     assert.equal(tracker.entryFor(full, "omawrapped").ignoreApps, "x")
   })
 
@@ -952,7 +1006,7 @@ describe("entryFor", () => {
         right: [{ id: "me", where: "right" }],
       },
     }
-    assert.equal(tracker.entryFor(odd, "me"), odd.layout.right[0])
+    assert.deepEqual(plain(tracker.entryFor(odd, "me")), odd.layout.right[0])
     const nothing = { layout: { left: "me", center: { id: "me" }, right: 5 } }
     assert.deepEqual(plain(tracker.entryFor(nothing, "me")), {})
     // list-like but not an array
@@ -960,10 +1014,16 @@ describe("entryFor", () => {
     assert.deepEqual(plain(tracker.entryFor(arrayLike, "me")), {})
   })
 
+  test("a configuration that cannot be read as JSON gives {}", () => {
+    const loop = { layout: { left: [], center: [], right: [{ id: "me" }] } }
+    loop.self = loop
+    assert.deepEqual(plain(tracker.entryFor(loop, "me")), {})
+  })
+
   test("skips items that are not objects", () => {
     const wanted = { id: "me", real: true }
     const list = { layout: { left: [null, undefined, 5, "me", true, 0, wanted], center: [], right: [] } }
-    assert.equal(tracker.entryFor(list, "me"), wanted)
+    assert.deepEqual(plain(tracker.entryFor(list, "me")), wanted)
     const only = { layout: { left: [null, "me", 5], center: [], right: [] } }
     assert.deepEqual(plain(tracker.entryFor(only, "me")), {})
   })
