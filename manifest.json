@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.davidgudovic.omawrapped",
   "name": "OmaWrapped",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "David Gudovic",
   "license": "MIT",
   "description": "Your week on Omarchy as a shareable card: screen time, top apps, busiest day and hour, and git commits. Counted by the shell itself and kept on your machine.",
@@ -17,6 +17,7 @@
     "defaultSection": "right",
     "defaults": {
       "display": "time",
+      "paused": false,
       "idleSeconds": 120,
       "countKeptAwake": true,
       "ignoreApps": "",
@@ -30,6 +31,13 @@
         "options": ["time", "icon"],
         "defaultValue": "time",
         "description": "'time' shows today's screen time beside the icon; 'icon' shows the icon alone."
+      },
+      {
+        "key": "paused",
+        "type": "boolean",
+        "label": "Pause counting",
+        "defaultValue": false,
+        "description": "Nothing is counted while this is on. The widget's menu and `omawrapped pause` set it too. Unlike disabling the plugin, it keeps your other settings."
       },
       {
         "key": "idleSeconds",

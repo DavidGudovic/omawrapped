@@ -230,7 +230,7 @@ def commit(repo, authored: datetime, email: str = ME, committed: datetime = None
 # ---- The CLI and the programs it starts ----
 
 # Every program the command starts that would reach the live desktop. Each has a stand-in, always.
-STUBBED = ("omarchy-shell", "wl-copy", "xdg-open", "nautilus", "uwsm-app", "notify-send",
+STUBBED = ("omarchy-shell", "omarchy-bar", "wl-copy", "xdg-open", "nautilus", "uwsm-app", "notify-send",
            "omarchy-notification-send", "omarchy-menu-select")
 # What the command needs besides, and that does nothing to the desktop: these are the real programs.
 TOOLS = ("rsvg-convert", "fc-match", "git")
@@ -245,7 +245,8 @@ def real_tool(name: str):
 
 # What every stand-in runs. /usr/bin/python3 is absolute, so a stand-in starts whatever its PATH. It logs one JSON
 # list of its arguments per call (a tab or a newline in an argument stays what it was) and exits 0, unless the test
-# made it fail. wl-copy also keeps what it read on its standard input.
+# made it fail. wl-copy also keeps what it read on its standard input. A stand-in that fails says why on stderr when
+# the test gave a reason, and omarchy-bar always does.
 STAND_IN = """#!/usr/bin/python3 -IBS
 import json, os, sys
 
@@ -274,14 +275,32 @@ def read(*parts):
 
 code = read("exit", name)
 if code is not None:
+    reason = read("reason", name)
+    if reason is None and name == "omarchy-bar":
+        reason = "no widget is called that"
+    if reason:
+        sys.stderr.write(reason if reason.endswith("\\n") else reason + "\\n")
     sys.exit(int(code))
 if name == "omarchy-shell":
     # The sampler answers a canned reply to `status`, and "ok" to anything else unless it has been made deaf.
     method = arguments[1] if len(arguments) > 1 else ""
     if method == "status":
-        sys.stdout.write(read("shell-status-reply") or "")
+        # Replies given one to a call are used in turn, the last one for good; an empty line is no answer.
+        replies = read("shell-status-replies")
+        if replies is None:
+            sys.stdout.write(read("shell-status-reply") or "")
+        else:
+            lines = replies.splitlines() or [""]
+            seen = int(read("shell-status-seen") or 0)
+            with open(os.path.join(state, "shell-status-seen"), "w", encoding="utf-8") as handle:
+                handle.write(str(seen + 1))
+            sys.stdout.write(lines[min(seen, len(lines) - 1)])
     elif read("shell-is-deaf") is None:
         print("ok")
+elif name == "omarchy-bar":
+    # `set <id> <key> <value> --json` reports the change as Omarchy does.
+    if arguments[:1] == ["set"] and len(arguments) >= 3:
+        print("Set %%s on %%s" %% (arguments[2], arguments[1]))
 elif name == "omarchy-menu-select":
     # The menu answers with the label the test chose; with none, it was dismissed.
     choice = read("menu-choice")
@@ -299,7 +318,8 @@ class Stubs:
     whatever is installed on the machine. A tool that is not installed is simulated by removing its stand-in.
 
     Each stand-in appends its arguments to its own log, one line per call, and exits 0. omarchy-shell can also be
-    given a canned reply to `status`; it answers "ok" to anything else, as the sampler does.
+    given a canned reply to `status`, or one reply after the other; it answers "ok" to anything else, as the sampler
+    does. omarchy-bar reports `set` as Omarchy does and changes nothing: no test can alter the real configuration.
     """
 
     def __init__(self, root: Path):
@@ -307,16 +327,14 @@ class Stubs:
         self.tools = root / "tools"
         self.logs = root / "stublogs"
         self.state = root / "stubstate"
-        for folder in (self.dir, self.tools, self.logs, self.state, self.state / "exit"):
+        for folder in (self.dir, self.tools, self.logs, self.state, self.state / "exit", self.state / "reason"):
             folder.mkdir()
         self.reply = self.state / "shell-status-reply"
+        self.replies = self.state / "shell-status-replies"
         self.deaf = self.state / "shell-is-deaf"
         self.choice = self.state / "menu-choice"
         for name in STUBBED:
-            script = self.dir / name
-            script.write_text(STAND_IN % {"name": json.dumps(name), "logs": json.dumps(str(self.logs)),
-                                          "state": json.dumps(str(self.state))}, encoding="utf-8")
-            script.chmod(0o755)
+            self._write_stand_in(self.dir / name)
         for name in TOOLS:
             found = real_tool(name)
             if found:
@@ -324,6 +342,12 @@ class Stubs:
         for name in STUBBED:
             if shutil.which(name, path=self.path) != str(self.dir / name):
                 raise RuntimeError("%s would not be the stand-in, so a test could reach the real one" % name)
+
+    def _write_stand_in(self, script: Path) -> None:
+        """The stand-in, named like the file, in place."""
+        script.write_text(STAND_IN % {"name": json.dumps(script.name), "logs": json.dumps(str(self.logs)),
+                                      "state": json.dumps(str(self.state))}, encoding="utf-8")
+        script.chmod(0o755)
 
     @property
     def path(self) -> str:
@@ -337,9 +361,20 @@ class Stubs:
             if shutil.which(name, path=self.path):
                 raise RuntimeError("%s can still be found on the path of the tests" % name)
 
-    def fail(self, name: str, code: int = 1) -> None:
-        """From now on the stand-in exits with `code` (after logging its call, and printing nothing)."""
+    def fail(self, name: str, code: int = 1, reason: str = None) -> None:
+        """From now on the stand-in exits with `code`, after logging its call and printing `reason` on stderr.
+
+        Without a reason it prints nothing, except omarchy-bar, which always says something; reason="" makes it
+        say nothing too.
+        """
         (self.state / "exit" / name).write_text(str(code), encoding="utf-8")
+        if reason is not None:
+            (self.state / "reason" / name).write_text(reason, encoding="utf-8")
+
+    def replace_tool(self, name: str) -> None:
+        """Puts a stand-in in place of a harmless real tool (one of TOOLS), to see whether it is ever started."""
+        (self.tools / name).unlink(missing_ok=True)
+        self._write_stand_in(self.tools / name)
 
     def choose_in_menu(self, label: str) -> None:
         """The menu stand-in answers with this label. Without it, the menu was dismissed."""
@@ -378,7 +413,21 @@ class Stubs:
         return self.calls(name)
 
     def reply_to_status(self, text: str) -> None:
+        """The shell answers `status` with this text, every time. It replaces any replies given in turn."""
+        self.replies.unlink(missing_ok=True)
         self.reply.write_text(text, encoding="utf-8")
+
+    def reply_to_status_in_turn(self, *texts: str) -> None:
+        """The shell answers `status` with the first text, then the second, and so on; the last one for good.
+
+        An empty text is no answer at all. Each is one line, as the sampler's JSON is. It replaces any reply given
+        before, and the count of the calls starts again.
+        """
+        for text in texts:
+            if "\n" in text:
+                raise ValueError("a reply is one line")
+        (self.state / "shell-status-seen").unlink(missing_ok=True)
+        self.replies.write_text("".join(text + "\n" for text in texts), encoding="utf-8")
 
     def stop_answering(self) -> None:
         """From now on flush and discard get no answer, as from a shell that is hanging."""

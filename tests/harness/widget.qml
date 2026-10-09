@@ -21,6 +21,7 @@ ShellRoot {
     id: fakeService
     property bool ready: false
     property real todayMs: 0
+    property bool paused: false
   }
 
   // What the bar offers a widget and its buttons.
@@ -79,7 +80,14 @@ ShellRoot {
       equal("today", widget.today, "2h 05m")
       equal("time shown", widget.showTime, true)
       equal("tooltip", widget.tooltip,
-        "2h 05m of screen time today · click: week card · right: month card · middle: copy or show it")
+        "2h 05m of screen time today · click: week card · right: month card · middle: more")
+      equal("the time stands beside the icon", widget.caption, "2h 05m")
+      fakeService.paused = true
+      equal("a paused service is named as such", widget.caption, "paused")
+      equal("and the tooltip says how to resume", widget.tooltip,
+        "Counting is paused at 2h 05m today · middle click: resume, and more")
+      fakeService.paused = false
+      equal("counting again, the time is back", widget.caption, "2h 05m")
       equal("the icon is the chart box", widget.glyph, glyph)
       truthy("has a width", widget.implicitWidth > 40)
       equal("as tall as the bar", widget.implicitHeight, 26)
@@ -118,8 +126,9 @@ ShellRoot {
     }],
     [2500, function() {
       equal("the menu was asked for under the plugin's name", lines("menu-asked.txt")[0], "OmaWrapped")
-      equal("it offers copying the card", lines("menu-asked.txt").join("|").indexOf("\tCopy card") !== -1, true)
-      equal("and showing it in its folder", lines("menu-asked.txt").join("|").indexOf("\tShow in folder") !== -1, true)
+      // Nothing answers for the sampler here, so the last entry is the pause.
+      equal("it offers today, the cards, the last card and a pause", offered().join("|"),
+        "Today so far|Card of the last 7 days|Card of the last 30 days|Copy card|Show in folder|Pause counting")
       equal("a dismissed menu is not an error", notifications().length, 1)
       // Now something is chosen, but there is no card to copy yet.
       choice.setText("Copy card\n")
@@ -155,6 +164,25 @@ ShellRoot {
       equal("the menu shows the card in its folder",
         lines("started.txt").indexOf("uwsm-app -- nautilus --select " + harness.card) !== -1, true)
       equal("without another notification", notifications().length, 3)
+      choice.setText("Today so far\n")
+      widget.handlePress(Qt.MiddleButton)
+    }],
+    [2500, function() {
+      var sent = notifications()
+      equal("today so far is a notification", sent.length, 4)
+      truthy("with the time as its headline: " + (sent[3] || [])[4], /^Today: \d/.test((sent[3] || [])[4] || ""))
+      truthy("and the top apps under it: " + (sent[3] || [])[5], /^\S.* · \S/.test((sent[3] || [])[5] || ""))
+      equal("the clipboard is left alone", lines("started.txt").filter(function(line) {
+        return line.indexOf("wl-copy") === 0
+      }).length, 1)
+      choice.setText("Pause counting\n")
+      widget.handlePress(Qt.MiddleButton)
+    }],
+    [4000, function() {
+      // The pause is a setting, saved through Omarchy's own command.
+      equal("the pause is saved as the widget's setting",
+        lines("started.txt").indexOf("omarchy-bar set " + pluginId + " paused true --json") !== -1, true)
+      equal("with no sampler to follow it, that is all", notifications().length, 4)
       widget.destroy()
     }]
   ]
@@ -173,6 +201,11 @@ ShellRoot {
     var text = view.text()
     view.destroy()
     return text === "" ? [] : text.replace(/\n$/, "").split("\n")
+  }
+
+  // The labels the menu was last asked to offer, without their glyphs.
+  function offered() {
+    return lines("menu-asked.txt").slice(1).map(function(line) { return line.split("\t")[1] || line })
   }
 
   // Every notification sent so far, each as its list of arguments.

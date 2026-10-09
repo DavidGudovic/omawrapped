@@ -1,4 +1,4 @@
-"""The omawrapped command: card, copy, show, menu, stats, status, reset."""
+"""The omawrapped command: card, today, copy, show, pause, resume, menu, stats, status, reset."""
 
 import argparse
 import json
@@ -9,6 +9,7 @@ import subprocess
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from time import sleep
 
 from . import PLUGIN_ID, VERSION, aggregate, card, gitstats, render, share, store, system
 
@@ -21,16 +22,21 @@ def _say(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def _omarchy_env() -> dict:
+    """The environment for Omarchy's own commands, which want to know where Omarchy is."""
+    env = dict(os.environ)
+    env.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
+    return env
+
+
 def _shell(method: str):
     """Calls the running sampler over the shell's IPC. None when it cannot be reached."""
     if not shutil.which("omarchy-shell"):
         return None
-    env = dict(os.environ)
-    env.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
     try:
         done = subprocess.run(
             ["omarchy-shell", PLUGIN_ID, method],
-            capture_output=True, text=True, timeout=5, env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=5, env=_omarchy_env(), stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -53,6 +59,11 @@ def _sampler():
     return status, status.get("dataDir") == str(store.data_dir())
 
 
+def _paused(status, ours) -> bool:
+    """Whether the sampler that records to this folder has been told to stop counting. No key in its status: no."""
+    return bool(ours and status.get("paused") is True)
+
+
 def _repo_dirs(repos) -> list:
     """The folders to look for git repositories in: the ones asked for, else the widget's setting, else the defaults."""
     if repos:
@@ -60,10 +71,14 @@ def _repo_dirs(repos) -> list:
     return system.split_list(system.settings().get("repoDirs")) or list(gitstats.DEFAULT_DIRS)
 
 
-def _collect(days: int, exclude, repos):
-    """(summary, git stats) for the last `days` days."""
+def _summary(days: int, exclude):
+    """(summary, status, ours) for the last `days` days: the sampler's status and ours, as _sampler() gives them.
+
+    Nothing here starts git, which is slow in a big folder.
+    """
+    status, ours = _sampler()
     # The sampler holds up to a minute in memory; ask it to write that first.
-    if _sampler()[1]:
+    if ours:
         _shell("flush")
     period = aggregate.last_days(days, date.today())
     names = system.AppNames()
@@ -72,25 +87,37 @@ def _collect(days: int, exclude, repos):
     hidden = list(exclude or ()) + system.split_list(system.settings().get("ignoreApps"))
     summary = aggregate.summarize(store.load_days(period.start, period.end), period, names.name,
                                   [system.app_key(app) for app in hidden])
+    return summary, status, ours
+
+
+def _collect(days: int, exclude, repos):
+    """(summary, git stats, status, ours) for the last `days` days: _summary() and the commits of the period."""
+    summary, status, ours = _summary(days, exclude)
+    period = summary.period
     start = datetime.combine(period.start, time.min).astimezone()
     end = datetime.combine(period.end + timedelta(days=1), time.min).astimezone()
-    return summary, gitstats.count_commits(_repo_dirs(repos), start, end)
+    return summary, gitstats.count_commits(_repo_dirs(repos), start, end), status, ours
 
 
 # A card needs at least a minute to say anything: times are shown in minutes.
 ENOUGH_MS = 60000
 
 
-def _too_little(summary: aggregate.Summary) -> str:
-    """Why there is no card to draw, and what to do about it."""
+def _too_little(summary: aggregate.Summary, status, ours) -> str:
+    """Why there is no card to draw, and what to do about it. It depends on whether our sampler is there to count."""
     period = summary.period
+    when = "today" if period.length == 1 else "the last %d days" % period.length
+    if _paused(status, ours):
+        return ("OmaWrapped has counted less than a minute for %s, and counting is paused. "
+                "Resume it from the widget's menu or with `omawrapped resume`." % when)
+    if ours:
+        return ("OmaWrapped has counted less than a minute for %s so far. "
+                "It is counting now: try again in a minute." % when)
     return (
         "%s was recorded for %s (%s).\n"
         "OmaWrapped counts while its widget is enabled in the bar: omarchy plugin enable %s\n"
         "Data folder: %s" % (
-            "Less than a minute" if summary.total_ms else "Nothing",
-            "today" if period.length == 1 else "the last %d days" % period.length,
-            period.span, PLUGIN_ID, store.data_dir())
+            "Less than a minute" if summary.total_ms else "Nothing", when, period.span, PLUGIN_ID, store.data_dir())
     )
 
 
@@ -128,9 +155,9 @@ def _announce(path: Path, copied) -> None:
 def _draw_card(days: int, output=None, copy="path", open_it=False, notify=False, exclude=None, repos=None,
                theme=None) -> int:
     """Draws the card of the last `days` days, saves it, and does what was asked with it. The exit status."""
-    summary, git = _collect(days, exclude, repos)
+    summary, git, status, ours = _collect(days, exclude, repos)
     if summary.total_ms < ENOUGH_MS:
-        _say(_too_little(summary))
+        _say(_too_little(summary, status, ours))
         return 1
     if theme and not (Path(theme).expanduser() / "colors.toml").is_file():
         _say("%s is not a theme folder: it has no colors.toml." % theme)
@@ -172,6 +199,126 @@ def _draw_card(days: int, output=None, copy="path", open_it=False, notify=False,
 
 def cmd_card(args) -> int:
     return _draw_card(args.days, args.output, args.copy, args.open, args.notify, args.exclude, args.repos, args.theme)
+
+
+# ---- today ----
+
+def _app_row(name: str, ms: int) -> str:
+    """One app of a list: its name, cut to 28 characters, and its time, in columns."""
+    return "  %-28.28s %9s" % (name, aggregate.duration(ms))
+
+
+def _today(notify: bool) -> int:
+    """Says how long today has been and which apps it was spent in. The exit status, which is always 0."""
+    summary, status, ours = _summary(1, None)
+    paused = _paused(status, ours)
+    counted = summary.total_ms >= ENOUGH_MS
+    total = aggregate.duration(summary.total_ms) if counted else "nothing counted yet"
+    # Under a minute every time would read "0m", so no apps are listed.
+    apps = summary.apps[:5] if counted else []
+    print("Today  %s%s" % (total, " (paused)" if paused else ""))
+    for name, ms in apps:
+        print(_app_row(name, ms))
+    if notify:
+        body = " · ".join("%s %s" % (name, aggregate.duration(ms)) for name, ms in apps[:3])
+        if paused:
+            body = body + " · counting is paused" if body else "Counting is paused."
+        share.notify("Today: " + total, body)
+    return 0
+
+
+def cmd_today(args) -> int:
+    return _today(args.notify)
+
+
+# ---- pause, resume ----
+
+# OMAWRAPPED_POLL_SECONDS (for the tests) is how long to wait between two looks at the sampler.
+POLL_SECONDS = 0.2
+# The sampler follows a changed setting within a moment: a look every 0.2 seconds for two seconds is plenty.
+POLLS = 10
+
+
+def _wait(seconds: float) -> None:
+    """The pause between two looks at the sampler."""
+    sleep(seconds)
+
+
+def _poll_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("OMAWRAPPED_POLL_SECONDS", POLL_SECONDS)))
+    except ValueError:
+        return POLL_SECONDS
+
+
+def _save_paused(paused: bool):
+    """Changes the widget's `paused` setting through Omarchy. None when it was saved, else why not, in a sentence."""
+    word = "true" if paused else "false"
+    if not shutil.which("omarchy-bar"):
+        return "omarchy-bar was not found, so the pause could not be %s. It is part of Omarchy 4." % (
+            "saved" if paused else "lifted")
+    reason = ""
+    try:
+        done = subprocess.run(
+            ["omarchy-bar", "set", PLUGIN_ID, "paused", word, "--json"], capture_output=True, text=True,
+            errors="replace", timeout=10, env=_omarchy_env(), stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    else:
+        if done.returncode == 0:
+            return None
+        # Omarchy's commands say "omarchy-bar: could not find widget ...": the reason is what follows the name.
+        lines = done.stderr.strip().splitlines()
+        reason = lines[0].strip().removeprefix("omarchy-bar: ").rstrip(".") if lines else ""
+    return "Omarchy did not accept the change: %s. Is the widget enabled?" % (reason or "no reason given")
+
+
+def _followed(paused: bool):
+    """Whether the sampler took up the setting: True, False when it answers and has not, None when nothing answers."""
+    answered = False
+    for attempt in range(POLLS):
+        if attempt:
+            _wait(_poll_seconds())
+        status, ours = _sampler()
+        if status is None:
+            continue
+        answered = True
+        if ours and _paused(status, ours) == paused:
+            return True
+    return False if answered else None
+
+
+def _set_paused(paused: bool, notify: bool) -> int:
+    """Stops or restarts the counting, and waits for the sampler to follow. The exit status."""
+    problem = _save_paused(paused)
+    if problem:
+        _say(problem)
+        return 1
+    followed = _followed(paused)
+    if followed is None:
+        print("Saved. The sampler is not running; it will %s." % ("start paused" if paused else "count when it starts"))
+        return 0
+    if not followed:
+        _say("The setting was saved, but the sampler has not followed. See `omawrapped status`.")
+        return 1
+    if paused:
+        print("Counting is paused. `omawrapped resume`, or the widget's menu, starts it again.")
+        if notify:
+            share.notify("Counting paused", "Resume it from the widget's menu.")
+    else:
+        print("Counting again.")
+        if notify:
+            share.notify("Counting again", "")
+    return 0
+
+
+def cmd_pause(args) -> int:
+    return _set_paused(True, args.notify)
+
+
+def cmd_resume(args) -> int:
+    return _set_paused(False, args.notify)
 
 
 # ---- copy, show, menu ----
@@ -233,26 +380,38 @@ def cmd_show(args) -> int:
     return _show_card(args.file)
 
 
-# The menu: (glyph, label, what choosing it does). Each does what the command of the same name does.
-MENU = (
-    ("\U000f018f", "Copy card", lambda: _copy_card(None, True)),
-    ("\U000f0770", "Show in folder", lambda: _show_card(None)),
-    ("\U000f0a33", "Card of the last 7 days",
-     lambda: _draw_card(aggregate.PERIODS["week"], copy="image", open_it=True, notify=True)),
-    ("\U000f0e17", "Card of the last 30 days",
-     lambda: _draw_card(aggregate.PERIODS["month"], copy="image", open_it=True, notify=True)),
-)
+def _menu() -> list:
+    """The menu: (glyph, label, what choosing it does). Each does what the command of the same name does.
+
+    The last entry is whichever of pause and resume makes sense, so the sampler is asked when the menu opens.
+    """
+    status, ours = _sampler()
+    if _paused(status, ours):
+        last = ("\U000f040a", "Resume counting", lambda: _set_paused(False, True))
+    else:
+        last = ("\U000f03e4", "Pause counting", lambda: _set_paused(True, True))
+    return [
+        ("\U000f0150", "Today so far", lambda: _today(True)),
+        ("\U000f0a33", "Card of the last 7 days",
+         lambda: _draw_card(aggregate.PERIODS["week"], copy="image", open_it=True, notify=True)),
+        ("\U000f0e17", "Card of the last 30 days",
+         lambda: _draw_card(aggregate.PERIODS["month"], copy="image", open_it=True, notify=True)),
+        ("\U000f018f", "Copy card", lambda: _copy_card(None, True)),
+        ("\U000f0770", "Show in folder", lambda: _show_card(None)),
+        last,
+    ]
 
 
 def cmd_menu(args) -> int:
+    entries = _menu()
     try:
-        label = share.choose("OmaWrapped", ["%s\t%s" % (glyph, name) for glyph, name, _ in MENU])
+        label = share.choose("OmaWrapped", ["%s\t%s" % (glyph, name) for glyph, name, _ in entries])
     except share.ShareError as error:
         _say(str(error))
         return 1
     if label is None:
         return 0
-    for _, name, action in MENU:
+    for _, name, action in entries:
         if name == label:
             return action()
     _say("The menu answered %r, which is not one of its options." % label)
@@ -283,14 +442,14 @@ def _stats_json(summary, git) -> dict:
 
 
 def cmd_stats(args) -> int:
-    summary, git = _collect(args.days, args.exclude, args.repos)
+    summary, git, status, ours = _collect(args.days, args.exclude, args.repos)
     if args.json:
         print(json.dumps(_stats_json(summary, git), indent=2))
         return 0
     period = summary.period
     print("OmaWrapped · %s · %s\n" % (period.label, period.span))
     if summary.total_ms < ENOUGH_MS:
-        print(_too_little(summary))
+        print(_too_little(summary, status, ours))
         return 0
     busiest = summary.busiest_day
     rows = [
@@ -310,7 +469,7 @@ def cmd_stats(args) -> int:
         print("%-13s %s" % (label, value))
     print("\nTop apps")
     for name, ms in summary.apps[:10]:
-        print("  %-28.28s %9s  %3d%%" % (name, aggregate.duration(ms), round(100 * ms / summary.total_ms)))
+        print("%s  %3d%%" % (_app_row(name, ms), round(100 * ms / summary.total_ms)))
     print("\nBy day")
     most = busiest[1]
     for day, ms in summary.daily_ms:
@@ -344,8 +503,11 @@ def cmd_status(args) -> int:
         print("Sampler   running, but recording to %s, not the folder above" % sampler.get("dataDir"))
         ignored = system.split_list(sampler.get("ignoreApps"))
     else:
-        state = "counting" if sampler.get("counting") else (
-            "paused (session locked)" if sampler.get("locked") else "paused (away)")
+        if _paused(sampler, ours):
+            state = "paused by you (`omawrapped resume` starts it again)"
+        else:
+            state = "counting" if sampler.get("counting") else (
+                "paused (session locked)" if sampler.get("locked") else "paused (away)")
         print("Sampler   running, %s; away after %ss without input%s; today %s" % (
             state, sampler.get("idleSeconds"),
             "" if sampler.get("countKeptAwake", True) else " (a video or call does not count)",
@@ -362,6 +524,8 @@ def cmd_status(args) -> int:
                              else "MISSING (no notifications; results are still printed)"))
     print("Menu      %s" % ("omarchy-menu-select found" if shutil.which("omarchy-menu-select")
                            else "MISSING (the widget's middle-click menu needs Omarchy's menu)"))
+    print("Pause     %s" % ("omarchy-bar found" if shutil.which("omarchy-bar")
+                           else "MISSING (pausing needs Omarchy's bar command)"))
     if shutil.which("nautilus"):
         files = "nautilus found"
     elif shutil.which("xdg-open"):
@@ -371,9 +535,10 @@ def cmd_status(args) -> int:
     print("Files     %s" % files)
     dirs = _repo_dirs(None)
     repos = len(gitstats.find_repos(dirs))
-    print("Git       %s; %d repositor%s under %s" % (
+    print("Git       %s; %d repositor%s under %s%s" % (
         "found" if shutil.which("git") else "MISSING (package git)",
-        repos, "y" if repos == 1 else "ies", ", ".join(dirs)))
+        repos, "y" if repos == 1 else "ies", ", ".join(dirs),
+        "" if repos else " (the widget's repoDirs setting says where to look)"))
     return 0
 
 
@@ -415,6 +580,7 @@ def _days(text: str) -> int:
 
 def _add_period(parser) -> None:
     group = parser.add_mutually_exclusive_group()
+    group.add_argument("--today", dest="days", action="store_const", const=1, help="today only")
     group.add_argument("--week", dest="days", action="store_const", const=aggregate.PERIODS["week"],
                        help="the last 7 days, today included (default)")
     group.add_argument("--month", dest="days", action="store_const", const=aggregate.PERIODS["month"],
@@ -451,6 +617,12 @@ def parser() -> argparse.ArgumentParser:
                       help="take the colours from this theme folder instead of the active theme")
     make.set_defaults(run=cmd_card)
 
+    today = commands.add_parser("today", help="today's screen time and top apps",
+                                description="Print today's screen time and the apps it went to. "
+                                            "Nothing is drawn, and no repository is read.")
+    today.add_argument("--notify", action="store_true", help="say it on the desktop too")
+    today.set_defaults(run=cmd_today)
+
     copy = commands.add_parser("copy", help="copy the last card's image to the clipboard",
                                description="Copy a card's image to the clipboard, to paste into a post or a chat. "
                                            "Without FILE it is the newest card in your Pictures folder.")
@@ -464,10 +636,22 @@ def parser() -> argparse.ArgumentParser:
     show.add_argument("file", nargs="?", metavar="FILE", help="the card (default: the newest one)")
     show.set_defaults(run=cmd_show)
 
+    pause = commands.add_parser("pause", help="stop counting until you resume",
+                                description="Stop counting screen time until `omawrapped resume`. What is already "
+                                            "recorded stays. This sets the widget's paused setting in Omarchy.")
+    pause.add_argument("--notify", action="store_true", help="say on the desktop that counting is paused")
+    pause.set_defaults(run=cmd_pause)
+
+    resume = commands.add_parser("resume", help="count again after a pause",
+                                 description="Count screen time again after `omawrapped pause`.")
+    resume.add_argument("--notify", action="store_true", help="say on the desktop that counting is back")
+    resume.set_defaults(run=cmd_resume)
+
     menu = commands.add_parser("menu", help="pick one of the above from Omarchy's menu (what a middle click on the "
                                             "widget does)",
-                               description="Pick what to do with the card from Omarchy's menu: copy the last one, "
-                                           "show it in its folder, or draw a new one.")
+                               description="Pick what to do from Omarchy's menu: see today so far, draw a card of "
+                                           "the last 7 or 30 days, copy the last card or show it in its folder, "
+                                           "and pause or resume counting.")
     menu.set_defaults(run=cmd_menu)
 
     stats = commands.add_parser("stats", help="print the numbers behind the card",

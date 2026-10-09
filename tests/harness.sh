@@ -38,10 +38,15 @@ printf '%s\n' "$@" > "$OW_RUN/menu-asked.txt"
 [ -s "$OW_RUN/menu-choice" ] || exit 1
 cat "$OW_RUN/menu-choice"
 STUB
-# The rest only write down that they were started, and with what.
-for name in nautilus uwsm-app xdg-open wl-copy notify-send; do
+# The rest only write down that they were started, and with what. That
+# includes Omarchy's command for changing a setting: a case may pause, and
+# must never do it to the real bar.
+for name in nautilus uwsm-app xdg-open wl-copy notify-send omarchy-bar; do
   printf '#!/usr/bin/sh\necho "%s $*" >> "$OW_RUN/started.txt"\n' "$name" > "$RUN/bin/$name"
 done
+# The command asks the shell for its sampler. Here there is none to find,
+# and the real shell must not be asked.
+printf '#!/usr/bin/sh\nexit 1\n' > "$RUN/bin/omarchy-shell"
 chmod +x "$RUN"/bin/*
 
 env -i HOME="$RUN/home" XDG_RUNTIME_DIR="$RUN" XDG_DATA_HOME="$RUN/data" \
@@ -68,7 +73,8 @@ if [ "$CASE" = service ] && [ "$verdict" = PASS ]; then
   mode=$(stat -c %a "$RUN/data/omawrapped")
   if [ "$mode" != 700 ]; then echo "harness: data directory mode is $mode, expected 700" >&2; verdict=FAIL; fi
   # The case ends with a second it never flushes. The file had about 1300 ms
-  # before it; the shell closing must have added the rest.
+  # before it (and a second of pause, which adds nothing); the shell closing
+  # must have added the rest.
   written=$(jq -r '.active_ms' "$RUN"/data/omawrapped/days/*.json)
   if [ "$written" -ge 2100 ] && [ "$written" -le 2700 ]; then
     echo "OW-CHECK ok   written when the shell closed = $written (expected about 2300)"

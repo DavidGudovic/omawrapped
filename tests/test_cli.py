@@ -29,8 +29,33 @@ NO_XDG_OPEN = "xdg-open was not found (package xdg-utils), so the card was not o
 NO_MENU = ("omarchy-menu-select was not found, so there is no menu to show. "
            "`omawrapped copy` and `omawrapped show` do the same from a terminal.")
 CLICK_HINT = "Click here to show it in its folder."
-MENU = ["OmaWrapped", "\U000f018f\tCopy card", "\U000f0770\tShow in folder", "\U000f0a33\tCard of the last 7 days",
-        "\U000f0e17\tCard of the last 30 days"]
+# What the menu is given: the prompt, then five fixed options, then pause or resume, whichever makes sense.
+MENU = ["OmaWrapped", "\U000f0150\tToday so far", "\U000f0a33\tCard of the last 7 days",
+        "\U000f0e17\tCard of the last 30 days", "\U000f018f\tCopy card", "\U000f0770\tShow in folder"]
+PAUSE = "\U000f03e4\tPause counting"
+RESUME = "\U000f040a\tResume counting"
+STATUS = PLUGIN_ID + " status"
+FLUSH = PLUGIN_ID + " flush"
+
+
+def row(name: str, time: str) -> str:
+    """An app of a list under `omawrapped today`: two spaces, the name in 28 columns, the time in 9, right-aligned."""
+    return "  " + name.ljust(28) + " " + time.rjust(9)
+
+
+# Today as busy_day() writes it, as `omawrapped today` lists it: the top five apps, name and time in columns.
+TODAY = "Today  3h 07m"
+TODAY_ROWS = [
+    "  Ghostty                         1h 20m",
+    "  Chromium                           52m",
+    "  Zed                                31m",
+    "  Slack                              14m",
+    "  Obsidian                            6m",
+]
+TODAY_BODY = "Ghostty 1h 20m \u00b7 Chromium 52m \u00b7 Zed 31m"
+NOT_FOLLOWED = "The setting was saved, but the sampler has not followed. See `omawrapped status`.\n"
+# The pause between two looks at the sampler, so that the tests do not wait for the real 0.2 seconds.
+FAST = {"OMAWRAPPED_POLL_SECONDS": "0.01"}
 # The CLI runs with the stand-ins and links to the harmless real tools on its PATH: the renderer is one of them.
 needs_renderer = unittest.skipUnless(real_tool("rsvg-convert"), "rsvg-convert is not installed")
 
@@ -50,12 +75,21 @@ class CliCase(IsolatedCase):
         self.work.mkdir()
         self.addCleanup(self.assert_no_bytecode)
 
-    def sampler(self, **fields) -> None:
-        """A running sampler, as the shell stand-in reports it. By default it records to this test's data folder."""
+    def sampler_reply(self, **fields) -> str:
+        """What a running sampler answers to `status`. By default it records to this test's data folder."""
         status = {"counting": True, "locked": False, "idleSeconds": 120, "countKeptAwake": True, "ignoreApps": [],
                   "todayMs": 0, "dataDir": str(self.data_home / "omawrapped")}
         status.update(fields)
-        self.stubs.reply_to_status(json.dumps(status))
+        return json.dumps(status)
+
+    def sampler(self, **fields) -> None:
+        """A running sampler, as the shell stand-in reports it."""
+        self.stubs.reply_to_status(self.sampler_reply(**fields))
+
+    def samplers(self, *replies) -> None:
+        """The sampler as it changes: one reply to each `status`, in turn, the last one for good. A reply is the
+        fields of sampler(), or None when nothing answers."""
+        self.stubs.reply_to_status_in_turn(*["" if reply is None else self.sampler_reply(**reply) for reply in replies])
 
     def assert_no_bytecode(self):
         self.assertEqual(bytecode_dirs(), [], "the launcher must not leave bytecode in the plugin folder")
@@ -86,6 +120,12 @@ class CliCase(IsolatedCase):
         """{date: the file's content} of every day file, read back with nothing but json."""
         return {date.fromisoformat(path.stem): json.loads(path.read_text(encoding="utf-8"))
                 for path in sorted(self.days.glob("*.json"))}
+
+    def busy_day(self) -> None:
+        """Today as 3h 07m in six apps, written in no order of time: the top five and the top three differ."""
+        minutes = {"slack": 14, "signal": 4, "com.mitchellh.ghostty": 80, "zed": 31, "obsidian": 6, "chromium": 52}
+        self.write_day(self.today, active_ms=sum(minutes.values()) * 60000,
+                       apps_ms={app: ms * 60000 for app, ms in minutes.items()})
 
     def window(self, length: int) -> list:
         """The fixture files of the last `length` days that were recorded, oldest first."""
@@ -137,7 +177,7 @@ class LauncherTests(CliCase):
     def test_no_arguments_prints_help_and_exits_0(self):
         result = self.ok()
         self.assertIn("usage: omawrapped", result.stdout)
-        for command in ("card", "copy", "show", "menu", "stats", "status", "reset"):
+        for command in ("card", "today", "copy", "show", "pause", "resume", "menu", "stats", "status", "reset"):
             self.assertIn(command, result.stdout)
         self.assertEqual(result.stderr, "")
 
@@ -146,7 +186,7 @@ class LauncherTests(CliCase):
         self.assertEqual(result.stdout.strip(), "omawrapped " + VERSION)
 
     def test_help_of_every_command(self):
-        for command in ("card", "copy", "show", "menu", "stats", "status", "reset"):
+        for command in ("card", "today", "copy", "show", "pause", "resume", "menu", "stats", "status", "reset"):
             with self.subTest(command=command):
                 self.assertIn("usage: omawrapped " + command, self.ok(command, "--help").stdout)
 
@@ -154,12 +194,22 @@ class LauncherTests(CliCase):
         # argparse wraps the help to the width of the terminal, so only the words are compared.
         words = " ".join(self.ok("--help").stdout.split())
         for text in ("copy the last card's image to the clipboard", "show the last card in the file manager",
-                     "pick one of the above from Omarchy's menu (what a middle click on the widget does)"):
+                     "pick one of the above from Omarchy's menu (what a middle click on the widget does)",
+                     "today's screen time and top apps", "stop counting until you resume",
+                     "count again after a pause"):
             self.assertIn(text, words)
+
+    def test_the_menu_says_everything_it_offers(self):
+        words = " ".join(self.ok("menu", "--help").stdout.split())
+        for text in ("today so far", "last 7 or 30 days", "copy the last card", "pause or resume counting"):
+            self.assertIn(text, words)
+        self.assertNotIn("with the card", words)
 
     def test_card_has_a_notify_option_and_copy_one_too_but_show_has_none(self):
         self.assertIn("--notify", self.ok("card", "--help").stdout)
         self.assertIn("--notify", self.ok("copy", "--help").stdout)
+        for command in ("today", "pause", "resume"):
+            self.assertIn("--notify", self.ok(command, "--help").stdout)
         self.assertNotIn("--notify", self.ok("show", "--help").stdout)
         self.assertNotIn("--notify", self.ok("menu", "--help").stdout)
 
@@ -462,6 +512,24 @@ class ArgumentErrorTests(CliCase):
         self.assert_argument_error("stats", "--days", "5", "--month", message="not allowed with argument")
         self.assert_argument_error("stats", "--week", "--days", "5", message="not allowed with argument")
 
+    def test_today_excludes_every_other_period_option_in_either_order(self):
+        for command in ("stats", "card"):
+            for other in (("--week",), ("--month",), ("--days", "3"), ("--days", "1")):
+                for args in (("--today", *other), (*other, "--today")):
+                    with self.subTest(command=command, args=args):
+                        self.assert_argument_error(command, *args, message="not allowed with argument")
+
+    def test_today_takes_no_period_and_no_file_but_a_notify_option(self):
+        self.assert_argument_error("today", "--days", "3", message="unrecognized arguments")
+        self.assert_argument_error("today", "--today", message="unrecognized arguments")
+        self.assert_argument_error("today", "x", message="unrecognized arguments")
+
+    def test_pause_and_resume_take_nothing_but_a_notify_option(self):
+        for command in ("pause", "resume"):
+            with self.subTest(command=command):
+                self.assert_argument_error(command, "--yes", message="unrecognized arguments")
+                self.assert_argument_error(command, "now", message="unrecognized arguments")
+
     def test_a_bad_copy_choice(self):
         self.assert_argument_error("card", "--copy", "everything", message="invalid choice")
 
@@ -472,6 +540,145 @@ class ArgumentErrorTests(CliCase):
     def test_copy_and_show_take_one_file_at_most(self):
         self.assert_argument_error("copy", "a.png", "b.png", message="unrecognized arguments")
         self.assert_argument_error("show", "a.png", "b.png", message="unrecognized arguments")
+
+
+class EmptyStateTests(CliCase):
+    """What `card` and `stats` say when less than a minute was counted: it depends on whether the sampler is there."""
+
+    def counting(self, when="the last 7 days"):
+        return ("OmaWrapped has counted less than a minute for %s so far. "
+                "It is counting now: try again in a minute." % when)
+
+    def paused(self, when="the last 7 days"):
+        return ("OmaWrapped has counted less than a minute for %s, and counting is paused. "
+                "Resume it from the widget's menu or with `omawrapped resume`." % when)
+
+    def lines(self, what="the last 7 days", length=7, first="Nothing"):
+        """The three lines for a machine without a sampler of ours, as they were."""
+        return ("%s was recorded for %s (%s).\n"
+                "OmaWrapped counts while its widget is enabled in the bar: omarchy plugin enable %s\n"
+                "Data folder: %s" % (first, what, aggregate.last_days(length, self.today).span, PLUGIN_ID,
+                                     self.data_home / "omawrapped"))
+
+    def said_by_card(self, *args) -> str:
+        result = self.run_cli("card", "-o", self.tmp / "c.svg", "--copy", "none", *args)
+        self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
+        self.assertFalse((self.tmp / "c.svg").exists())
+        self.assertTrue(result.stderr.endswith("\n"))
+        return result.stderr[:-1]
+
+    def said_by_stats(self, *args, length=7) -> str:
+        result = self.ok("stats", *args)
+        period = aggregate.last_days(length, self.today)
+        header = "OmaWrapped · %s · %s\n\n" % (period.label, period.span)
+        self.assertTrue(result.stdout.startswith(header), result.stdout)
+        self.assertTrue(result.stdout.endswith("\n"))
+        self.assertEqual(result.stderr, "")
+        return result.stdout[len(header):-1]
+
+    def test_a_counting_sampler_is_asked_to_be_patient_in_one_line(self):
+        self.sampler()
+        self.assertEqual(self.said_by_card(), self.counting())
+        self.assertEqual(self.said_by_stats(), self.counting())
+
+    def test_a_paused_sampler_says_how_to_resume_in_one_line(self):
+        self.sampler(paused=True)
+        self.assertEqual(self.said_by_card(), self.paused())
+        self.assertEqual(self.said_by_stats(), self.paused())
+
+    def test_a_status_without_the_paused_key_is_a_sampler_that_counts(self):
+        self.sampler(paused=False)
+        self.assertEqual(self.said_by_card(), self.counting())
+        self.sampler()
+        self.assertEqual(self.said_by_card(), self.counting())
+
+    def test_without_a_sampler_the_three_lines_stay_as_they_were(self):
+        self.assertEqual(self.said_by_card(), self.lines())
+        self.assertEqual(self.said_by_stats(), self.lines())
+
+    def test_a_sampler_that_records_elsewhere_is_no_sampler_of_ours(self):
+        # Its pause is not ours to report either.
+        for fields in ({}, {"paused": True}):
+            with self.subTest(fields=fields):
+                self.sampler(dataDir="/somewhere/else/omawrapped", **fields)
+                self.assertEqual(self.said_by_card(), self.lines())
+                self.assertEqual(self.said_by_stats(), self.lines())
+
+    def test_garbage_from_the_shell_is_no_sampler(self):
+        self.stubs.reply_to_status("this is not json")
+        self.assertEqual(self.said_by_card(), self.lines())
+
+    def test_a_few_seconds_are_still_less_than_a_minute_and_say_the_same(self):
+        self.write_day(self.today, active_ms=59999, apps_ms={"slack": 59999})
+        self.assertEqual(self.said_by_card(), self.lines(first="Less than a minute"))
+        self.sampler()
+        self.assertEqual(self.said_by_card(), self.counting())
+        self.assertEqual(self.said_by_stats(), self.counting())
+        self.sampler(paused=True)
+        self.assertEqual(self.said_by_stats(), self.paused())
+
+    def test_the_period_is_named_the_way_the_option_asks(self):
+        situations = (
+            ("no sampler", None, lambda when, length: self.lines(when, length)),
+            ("a counting one", {}, lambda when, length: self.counting(when)),
+            ("a paused one", {"paused": True}, lambda when, length: self.paused(when)),
+        )
+        options = ((("--today",), "today", 1), (("--month",), "the last 30 days", 30),
+                   (("--days", "3"), "the last 3 days", 3))
+        for name, fields, expected in situations:
+            if fields is not None:
+                self.sampler(**fields)
+            for args, when, length in options:
+                with self.subTest(sampler=name, args=args):
+                    self.assertEqual(self.said_by_card(*args), expected(when, length))
+                    self.assertEqual(self.said_by_stats(*args, length=length), expected(when, length))
+
+    def test_the_sampler_is_still_asked_to_flush_first(self):
+        self.sampler()
+        self.said_by_card()
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS, FLUSH])
+
+    def test_json_has_no_message_at_all(self):
+        self.sampler()
+        self.assertEqual(self.stats()["screen_time_ms"], 0)
+
+
+class TodayOptionTests(CliCase):
+    """--today is one day: the same as --days 1."""
+
+    def test_stats_for_today_is_stats_for_one_day(self):
+        self.record()
+        stats = self.stats("--today")
+        self.assertEqual(stats, self.stats("--days", "1"))
+        self.assertEqual(stats["period"], {"start": self.today.isoformat(), "end": self.today.isoformat(), "days": 1})
+        self.assertEqual(stats["screen_time_ms"], self.window(1)[0]["active_ms"])
+        self.assertEqual(len(stats["days"]), 1)
+
+    def test_the_text_report_is_headed_with_today(self):
+        self.record()
+        self.assertIn("OmaWrapped · Today · " + aggregate.last_days(1, self.today).span,
+                      self.ok("stats", "--today").stdout)
+        self.assertEqual(self.ok("stats", "--today").stdout, self.ok("stats", "--days", "1").stdout)
+
+    def test_a_card_for_today_is_the_card_of_one_day(self):
+        self.record()
+        self.ok("card", "--today", "-o", self.tmp / "a.svg", "--copy", "none")
+        self.ok("card", "--days", "1", "-o", self.tmp / "b.svg", "--copy", "none")
+        self.assertEqual(svg_texts(self.tmp / "a.svg"), svg_texts(self.tmp / "b.svg"))
+        self.assertIn("Today · " + aggregate.last_days(1, self.today).span, svg_texts(self.tmp / "a.svg"))
+
+    @needs_renderer
+    def test_the_default_name_of_a_card_for_today_is_the_one_of_one_day(self):
+        self.record()
+        self.assertEqual(self.ok("card", "--today", "--copy", "none").stdout,
+                         str(self.pictures / ("omawrapped-%s-1d.png" % self.today.isoformat())) + "\n")
+
+    def test_the_options_say_what_it_is(self):
+        for command in ("stats", "card"):
+            with self.subTest(command=command):
+                self.assertIn("--today", self.ok(command, "--help").stdout)
+        words = " ".join(self.ok("stats", "--help").stdout.split())
+        self.assertIn("--today today only", words)
 
 
 class CardTests(CliCase):
@@ -1087,20 +1294,442 @@ class ShowCommandTests(CliCase):
         self.assertEqual(self.stubs.wait_for_argv("uwsm-app"), [["--", "nautilus", "--select", str(card)]])
 
 
+class TodayTests(CliCase):
+    def test_lists_the_time_and_the_top_five_apps_most_time_first(self):
+        self.busy_day()
+        result = self.ok("today")
+        self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
+        self.assertTrue(result.stdout.endswith("\n"))
+        self.assertEqual(result.stderr, "")
+
+    def test_the_columns_are_those_of_the_top_apps_of_stats_without_the_percentage(self):
+        self.busy_day()
+        rows = self.ok("stats", "--today").stdout.split("Top apps\n")[1].split("\n\n")[0].splitlines()
+        self.assertEqual([line[:40] for line in rows][:5], TODAY_ROWS)
+        self.assertEqual(rows[0], TODAY_ROWS[0] + "   43%")
+
+    def test_fewer_apps_are_fewer_rows(self):
+        self.write_day(self.today, active_ms=5400000, apps_ms={"zed": 1800000, "com.mitchellh.ghostty": 3600000})
+        self.assertEqual(self.ok("today").stdout.splitlines(),
+                         ["Today  1h 30m", row("Ghostty", "1h 00m"), row("Zed", "30m")])
+
+    def test_a_long_name_is_cut_to_the_width_of_the_column(self):
+        self.write_day(self.today, active_ms=3600000, apps_ms={"a" * 40: 3600000})
+        self.assertEqual(self.ok("today").stdout.splitlines()[1], "  " + "A" + "a" * 27 + " " + "1h 00m".rjust(9))
+
+    def test_only_today_counts(self):
+        self.busy_day()
+        self.write_day(self.today - timedelta(days=1), active_ms=36000000, apps_ms={"discord": 36000000})
+        self.write_day(self.today + timedelta(days=1), active_ms=36000000, apps_ms={"discord": 36000000})
+        self.assertEqual(self.ok("today").stdout.splitlines(), [TODAY] + TODAY_ROWS)
+
+    def test_nothing_counted_yet(self):
+        result = self.ok("today")
+        self.assertEqual((result.stdout, result.stderr), ("Today  nothing counted yet\n", ""))
+
+    def test_less_than_a_minute_is_nothing_counted_yet_and_a_minute_is_something(self):
+        self.write_day(self.today, active_ms=59999, apps_ms={"slack": 59999})
+        self.assertEqual(self.ok("today").stdout, "Today  nothing counted yet\n")
+        self.write_day(self.today, active_ms=60000, apps_ms={"slack": 60000})
+        self.assertEqual(self.ok("today").stdout.splitlines(), ["Today  1m", row("Slack", "1m")])
+
+    def test_a_paused_sampler_is_said_in_the_first_line_in_both_cases(self):
+        self.sampler(paused=True)
+        self.assertEqual(self.ok("today").stdout, "Today  nothing counted yet (paused)\n")
+        self.busy_day()
+        self.assertEqual(self.ok("today").stdout.splitlines(), [TODAY + " (paused)"] + TODAY_ROWS)
+
+    def test_a_sampler_that_counts_says_nothing_of_pausing(self):
+        self.busy_day()
+        for fields in ({}, {"paused": False}, {"counting": False}):
+            with self.subTest(fields=fields):
+                self.sampler(**fields)
+                self.assertEqual(self.ok("today").stdout.splitlines(), [TODAY] + TODAY_ROWS)
+
+    def test_the_pause_of_a_sampler_that_records_elsewhere_is_not_ours_to_report(self):
+        self.busy_day()
+        self.sampler(paused=True, dataDir="/somewhere/else/omawrapped")
+        self.assertEqual(self.ok("today").stdout.splitlines(), [TODAY] + TODAY_ROWS)
+
+    def write_ignored(self, apps: str) -> None:
+        self.write(self.config / "omarchy" / "shell.json", json.dumps(
+            {"version": 1, "bar": {"layout": {"right": [{"id": PLUGIN_ID, "ignoreApps": apps}]}}}))
+
+    def test_ignored_apps_stay_out_and_the_next_one_takes_their_place(self):
+        self.busy_day()
+        self.write_ignored("SLACK, com.mitchellh.ghostty")
+        # The time is still screen time: the total does not change.
+        self.assertEqual(self.ok("today").stdout.splitlines(), [
+            TODAY, TODAY_ROWS[1], TODAY_ROWS[2], TODAY_ROWS[4], row("Signal", "4m")])
+
+    def test_ignoring_every_app_leaves_the_total_alone(self):
+        self.busy_day()
+        self.write_ignored("slack, signal, ghostty, zed, obsidian, chromium")
+        self.assertEqual(self.ok("today").stdout, TODAY + "\n")
+
+    def test_the_sampler_is_asked_to_flush_first(self):
+        self.sampler()
+        self.ok("today")
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS, FLUSH])
+
+    def test_a_sampler_that_is_not_ours_or_not_there_is_left_alone(self):
+        self.ok("today")
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS])
+        self.sampler(dataDir="/somewhere/else/omawrapped")
+        self.ok("today")
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS, STATUS])
+
+    def test_it_never_runs_git(self):
+        repos = self.tmp / "repos"
+        self.repo_with_commits(repos)
+        self.record()
+        self.stubs.replace_tool("git")
+        # The trap works: a command that does look at repositories does start it.
+        self.ok("stats", "--repos", repos)
+        self.assertNotEqual(self.stubs.argv("git"), [])
+        self.stubs.logs.joinpath("git.log").unlink()
+        self.write(self.config / "omarchy" / "shell.json", json.dumps(
+            {"version": 1, "bar": {"layout": {"right": [{"id": PLUGIN_ID, "repoDirs": str(repos)}]}}}))
+        self.ok("today")
+        self.ok("today", "--notify")
+        self.assertEqual(self.stubs.argv("git"), [])
+
+    def test_it_writes_nothing(self):
+        self.ok("today", "--notify")
+        self.assertFalse((self.data_home / "omawrapped").exists())
+        self.assertFalse(self.pictures.exists())
+        self.assert_nothing_started("omarchy-shell", "omarchy-notification-send")
+
+
+class TodayNotifyTests(CliCase):
+    def sent(self, *args) -> list:
+        """What omarchy-notification-send was given by `today --notify`."""
+        self.ok("today", "--notify", *args)
+        return self.stubs.argv("omarchy-notification-send")
+
+    def test_the_headline_is_the_time_and_the_body_the_top_three_apps(self):
+        self.busy_day()
+        self.assertEqual(self.sent(), [self.notification("Today: 3h 07m", TODAY_BODY)])
+
+    def test_there_is_no_image_and_no_click_command(self):
+        self.busy_day()
+        argv = self.sent()[0]
+        self.assertEqual(argv, ["--app-name", "OmaWrapped", "-g", GLYPH, "Today: 3h 07m", TODAY_BODY])
+        self.assertNotIn("--image", argv)
+        self.assertNotIn("--exec", argv)
+
+    def test_fewer_than_three_apps(self):
+        self.write_day(self.today, active_ms=5400000, apps_ms={"zed": 1800000, "com.mitchellh.ghostty": 3600000})
+        self.assertEqual(self.sent(), [self.notification("Today: 1h 30m", "Ghostty 1h 00m · Zed 30m")])
+        self.write_day(self.today, active_ms=3600000, apps_ms={"zed": 3600000})
+        self.assertEqual(self.sent()[1:], [self.notification("Today: 1h 00m", "Zed 1h 00m")])
+
+    def test_nothing_counted_yet_has_an_empty_body(self):
+        self.assertEqual(self.sent(), [self.notification("Today: nothing counted yet", "")])
+
+    def test_less_than_a_minute_has_no_apps_either(self):
+        self.write_day(self.today, active_ms=59999, apps_ms={"slack": 59999})
+        self.assertEqual(self.sent(), [self.notification("Today: nothing counted yet", "")])
+
+    def test_a_paused_sampler_is_added_to_the_body(self):
+        self.busy_day()
+        self.sampler(paused=True)
+        self.assertEqual(self.sent(), [self.notification("Today: 3h 07m", TODAY_BODY + " · counting is paused")])
+
+    def test_a_paused_sampler_without_apps_has_only_that_for_a_body(self):
+        self.sampler(paused=True)
+        self.assertEqual(self.sent(), [self.notification("Today: nothing counted yet", "Counting is paused.")])
+
+    def test_time_in_ignored_apps_alone_is_time_without_apps(self):
+        self.write_day(self.today, active_ms=3600000, apps_ms={"slack": 3600000})
+        self.write(self.config / "omarchy" / "shell.json", json.dumps(
+            {"version": 1, "bar": {"layout": {"right": [{"id": PLUGIN_ID, "ignoreApps": "slack"}]}}}))
+        self.assertEqual(self.sent(), [self.notification("Today: 1h 00m", "")])
+        self.sampler(paused=True)
+        self.assertEqual(self.sent()[1:], [self.notification("Today: 1h 00m", "Counting is paused.")])
+
+    def test_the_output_is_printed_as_well(self):
+        self.busy_day()
+        self.assertEqual(self.ok("today", "--notify").stdout.splitlines(), [TODAY] + TODAY_ROWS)
+
+    def test_without_notify_nothing_is_said(self):
+        self.busy_day()
+        self.ok("today")
+        self.assert_nothing_started("omarchy-shell")
+
+    def test_notify_send_is_the_fallback(self):
+        self.busy_day()
+        self.stubs.remove("omarchy-notification-send")
+        self.ok("today", "--notify")
+        self.assertEqual(self.stubs.argv("notify-send"), [["-a", "OmaWrapped", "Today: 3h 07m", TODAY_BODY]])
+
+    def test_a_desktop_without_notifications_or_with_a_broken_one_is_not_an_error(self):
+        self.busy_day()
+        self.stubs.fail("omarchy-notification-send")
+        result = self.ok("today", "--notify")
+        self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
+        self.stubs.remove("omarchy-notification-send", "notify-send")
+        self.assertEqual(self.ok("today", "--notify").stdout.splitlines(), [TODAY] + TODAY_ROWS)
+
+
+class PausingTests:
+    """What `pause` and `resume` have in common, tested for each of them. The two classes below say how they differ.
+
+    The sampler is told to follow the setting by the stand-in: the pause between two looks is made short.
+    """
+
+    command = None       # the command under test
+    word = None          # what it sets paused to, as omarchy-bar is given it
+    paused = None        # the same as a status says it
+    confirmed = None     # what it prints when the sampler has followed
+    announced = None     # (headline, body) of the notification then
+    not_running = None   # what it prints when there is no sampler to follow
+
+    BAR = ["set", PLUGIN_ID, "paused", None, "--json"]
+
+    def run_it(self, *args, **extra):
+        return self.run_cli(self.command, *args, **{**FAST, **extra})
+
+    def following(self):
+        """A sampler that has followed the setting."""
+        self.sampler(paused=self.paused)
+
+    def not_following(self):
+        """A sampler that does what it was doing before."""
+        self.sampler(paused=not self.paused)
+
+    def bar_call(self) -> list:
+        return [part if part is not None else self.word for part in self.BAR]
+
+    def test_omarchy_is_asked_to_set_the_setting(self):
+        self.following()
+        self.assertEqual(self.run_it().returncode, 0)
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [self.bar_call()])
+
+    def test_confirmed_on_the_first_look(self):
+        self.following()
+        result = self.run_it()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, self.confirmed + "\n", ""))
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS])
+        self.assert_nothing_started("omarchy-shell", "omarchy-bar")
+
+    def test_confirmed_after_a_few_looks(self):
+        self.samplers({"paused": not self.paused}, {"paused": not self.paused}, {"paused": self.paused})
+        result = self.run_it()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, self.confirmed + "\n", ""))
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS] * 3)
+
+    def test_a_sampler_that_answers_late_is_a_sampler_that_followed(self):
+        self.samplers(None, None, None, {"paused": self.paused})
+        result = self.run_it()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, self.confirmed + "\n", ""))
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS] * 4)
+
+    def test_confirmed_on_the_last_look_and_not_after_it(self):
+        self.samplers(*[{"paused": not self.paused}] * 9, {"paused": self.paused})
+        self.assertEqual(self.run_it().returncode, 0)
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS] * 10)
+        self.samplers(*[{"paused": not self.paused}] * 10, {"paused": self.paused})
+        self.assertEqual(self.run_it().returncode, 1)
+
+    def test_a_sampler_that_never_follows_is_reported_after_ten_looks(self):
+        self.not_following()
+        result = self.run_it()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NOT_FOLLOWED))
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS] * 10)
+        self.assertEqual(len(self.stubs.argv("omarchy-bar")), 1)
+
+    def test_the_pause_between_two_looks_follows_the_environment(self):
+        self.not_following()
+        started = time.monotonic()
+        self.run_it(OMAWRAPPED_POLL_SECONDS="0")
+        self.assertLess(time.monotonic() - started, 1.5)
+        started = time.monotonic()
+        self.run_it(OMAWRAPPED_POLL_SECONDS="0.1")
+        self.assertGreaterEqual(time.monotonic() - started, 0.9)
+
+    def test_without_a_sampler_the_setting_is_saved_and_that_is_said(self):
+        result = self.run_it()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, self.not_running + "\n", ""))
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS] * 10)
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [self.bar_call()])
+
+    def test_garbage_from_the_shell_is_no_sampler(self):
+        self.stubs.reply_to_status("this is not json")
+        self.assertEqual(self.run_it().stdout, self.not_running + "\n")
+
+    def test_a_sampler_that_records_elsewhere_is_not_ours_to_confirm(self):
+        self.sampler(paused=self.paused, dataDir="/somewhere/else/omawrapped")
+        result = self.run_it()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NOT_FOLLOWED))
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS] * 10)
+
+    def test_the_sampler_is_only_asked_for_its_status(self):
+        self.following()
+        self.run_it()
+        self.not_following()
+        self.run_it()
+        self.assertEqual(set(self.stubs.calls("omarchy-shell")), {STATUS})
+
+    def test_notify_says_it_when_the_sampler_has_followed(self):
+        self.following()
+        result = self.run_it("--notify")
+        self.assertEqual((result.returncode, result.stdout), (0, self.confirmed + "\n"))
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(*self.announced)])
+
+    def test_notify_is_silent_when_the_sampler_has_not_followed_or_is_not_there(self):
+        self.not_following()
+        self.assertEqual(self.run_it("--notify").returncode, 1)
+        self.stubs.reply.unlink()
+        self.assertEqual(self.run_it("--notify").returncode, 0)
+        self.sampler(paused=self.paused, dataDir="/somewhere/else/omawrapped")
+        self.assertEqual(self.run_it("--notify").returncode, 1)
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+        self.assertEqual(self.stubs.argv("notify-send"), [])
+
+    def test_without_notify_nothing_is_said(self):
+        self.following()
+        self.run_it()
+        self.assert_nothing_started("omarchy-shell", "omarchy-bar")
+
+    def test_a_desktop_without_notifications_is_not_an_error(self):
+        self.following()
+        self.stubs.remove("omarchy-notification-send", "notify-send")
+        result = self.run_it("--notify")
+        self.assertEqual((result.returncode, result.stdout), (0, self.confirmed + "\n"))
+
+    def test_without_omarchy_bar_it_says_so(self):
+        self.following()
+        self.stubs.remove("omarchy-bar")
+        result = self.run_it("--notify")
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertEqual(result.stderr, "omarchy-bar was not found, so the pause could not be %s. "
+                                        "It is part of Omarchy 4.\n" % ("saved" if self.word == "true" else "lifted"))
+        # Nothing was changed, so nobody was asked or told anything.
+        self.assert_nothing_started()
+
+    def test_omarchy_refusing_gives_its_reason(self):
+        self.following()
+        self.stubs.fail("omarchy-bar", 3, reason="Unknown widget: %s\nTry `omarchy plugin list`." % PLUGIN_ID)
+        result = self.run_it("--notify")
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertEqual(result.stderr, "Omarchy did not accept the change: Unknown widget: %s. "
+                                        "Is the widget enabled?\n" % PLUGIN_ID)
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [self.bar_call()])
+        # The change was refused: the sampler was not asked whether it followed, and nothing was announced.
+        self.assert_nothing_started("omarchy-bar")
+
+    def test_omarchys_own_name_and_full_stop_are_left_out_of_the_reason(self):
+        self.stubs.fail("omarchy-bar", 1, reason="omarchy-bar: could not find widget %s." % PLUGIN_ID)
+        self.assertEqual(self.run_it().stderr, "Omarchy did not accept the change: could not find widget %s. "
+                                               "Is the widget enabled?\n" % PLUGIN_ID)
+
+    def test_omarchy_refusing_without_a_reason(self):
+        self.following()
+        self.stubs.fail("omarchy-bar", 1, reason="")
+        result = self.run_it()
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertEqual(result.stderr, "Omarchy did not accept the change: no reason given. Is the widget enabled?\n")
+        self.assert_nothing_started("omarchy-bar")
+
+    def test_omarchy_refusing_with_a_blank_line_for_a_reason(self):
+        self.stubs.fail("omarchy-bar", 1, reason="\n\n")
+        self.assertIn("no reason given", self.run_it().stderr)
+
+    def test_omarchy_that_cannot_be_started(self):
+        self.following()
+        broken = self.stubs.dir / "omarchy-bar"
+        broken.write_text("#!/no/such/interpreter\n", encoding="utf-8")
+        broken.chmod(0o755)
+        result = self.run_it()
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertEqual(result.stderr, "Omarchy did not accept the change: no reason given. Is the widget enabled?\n")
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_the_shell_is_not_asked_before_the_setting_is_saved(self):
+        self.stubs.fail("omarchy-bar")
+        self.run_it()
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [])
+
+    def test_nothing_is_written_to_the_data_folder(self):
+        self.following()
+        self.run_it()
+        self.assertFalse((self.data_home / "omawrapped").exists())
+
+
+class PauseTests(PausingTests, CliCase):
+    command = "pause"
+    word = "true"
+    paused = True
+    confirmed = "Counting is paused. `omawrapped resume`, or the widget's menu, starts it again."
+    announced = ("Counting paused", "Resume it from the widget's menu.")
+    not_running = "Saved. The sampler is not running; it will start paused."
+
+    def test_a_status_without_the_paused_key_is_not_a_pause(self):
+        self.sampler()
+        self.assertEqual(self.run_it().returncode, 1)
+
+    def test_nine_looks_a_fifth_of_a_second_apart_without_the_variable(self):
+        self.sampler(paused=False)
+        started = time.monotonic()
+        self.assertEqual(self.run_cli("pause").returncode, 1)
+        self.assertGreaterEqual(time.monotonic() - started, 1.8)
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS] * 10)
+
+
+class ResumeTests(PausingTests, CliCase):
+    command = "resume"
+    word = "false"
+    paused = False
+    confirmed = "Counting again."
+    announced = ("Counting again", "")
+    not_running = "Saved. The sampler is not running; it will count when it starts."
+
+    def test_a_status_without_the_paused_key_is_a_sampler_that_counts(self):
+        self.sampler()
+        result = self.run_it()
+        self.assertEqual((result.returncode, result.stdout), (0, "Counting again.\n"))
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS])
+
+
 class MenuTests(CliCase):
-    def test_the_four_options_reach_the_menu_in_order_each_with_its_glyph_and_a_tab(self):
+    def assert_only_asked(self, *names):
+        """Nothing was started but the menu, the sampler (asked its status once, to build the menu) and the named."""
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", *names)
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS])
+
+    def test_the_six_options_reach_the_menu_in_order_each_with_its_glyph_and_a_tab(self):
         self.ok("menu")
-        self.assertEqual(self.stubs.argv("omarchy-menu-select"), [MENU])
-        for option in MENU[1:]:
+        self.assertEqual(self.stubs.argv("omarchy-menu-select"), [MENU + [PAUSE]])
+        self.assertEqual(len(self.stubs.argv("omarchy-menu-select")[0]), 7)
+        self.assertEqual(self.stubs.argv("omarchy-menu-select")[0][0], "OmaWrapped")
+        for option in MENU[1:] + [PAUSE]:
             glyph, tab, label = option.partition("\t")
             self.assertEqual((len(glyph), tab), (1, "\t"), option)
+
+    def test_the_last_option_is_pause_without_a_sampler_and_with_one_that_counts(self):
+        cases = [("no sampler", None), ("one that counts", {}), ("one that says it is not paused", {"paused": False}),
+                 ("one that is away", {"counting": False}), ("one that is locked", {"counting": False, "locked": True}),
+                 ("one that records elsewhere", {"paused": True, "dataDir": "/somewhere/else/omawrapped"})]
+        for name, fields in cases:
+            with self.subTest(sampler=name):
+                if fields is not None:
+                    self.sampler(**fields)
+                self.ok("menu")
+                self.assertEqual(self.stubs.argv("omarchy-menu-select")[-1], MENU + [PAUSE])
+
+    def test_the_last_option_is_resume_when_our_sampler_is_paused(self):
+        self.sampler(paused=True)
+        self.ok("menu")
+        self.assertEqual(self.stubs.argv("omarchy-menu-select"), [MENU + [RESUME]])
+        self.assert_only_asked()
 
     def test_a_dismissed_menu_does_nothing_and_succeeds(self):
         self.record()
         self.make_card()
         result = self.run_cli("menu")
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-        self.assert_nothing_started("omarchy-menu-select")
+        self.assert_only_asked()
 
     def test_a_missing_menu_is_an_error(self):
         self.stubs.remove("omarchy-menu-select")
@@ -1108,14 +1737,14 @@ class MenuTests(CliCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, NO_MENU + "\n")
-        self.assert_nothing_started()
+        self.assert_nothing_started("omarchy-shell")
 
     def test_a_menu_that_breaks_is_an_error(self):
         self.stubs.fail("omarchy-menu-select", 2)
         result = self.run_cli("menu")
         self.assertEqual(result.returncode, 1)
         self.assertIn("omarchy-menu-select", result.stderr)
-        self.assert_nothing_started("omarchy-menu-select")
+        self.assert_only_asked()
 
     def test_an_answer_that_is_not_an_option_does_nothing(self):
         self.make_card()
@@ -1123,7 +1752,102 @@ class MenuTests(CliCase):
         result = self.run_cli("menu")
         self.assertEqual(result.returncode, 1)
         self.assertIn("Delete everything", result.stderr)
-        self.assert_nothing_started("omarchy-menu-select")
+        self.assert_only_asked()
+
+    def test_the_option_that_is_not_on_offer_cannot_be_chosen(self):
+        # Pause is offered to a sampler that counts, resume to one that does not: the other is not an option.
+        self.sampler(paused=True)
+        self.stubs.choose_in_menu("Pause counting")
+        result = self.run_cli("menu")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Pause counting", result.stderr)
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [])
+
+    def test_today_so_far_does_what_today_notify_does(self):
+        self.busy_day()
+        self.stubs.choose_in_menu("Today so far")
+        result = self.ok("menu")
+        self.assertEqual(result.stdout.splitlines(), [TODAY] + TODAY_ROWS)
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification("Today: 3h 07m", TODAY_BODY)])
+        # The menu asked the sampler for its status, and `today` asked again.
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS, STATUS])
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "omarchy-notification-send")
+
+    def test_today_so_far_without_anything_counted(self):
+        self.stubs.choose_in_menu("Today so far")
+        result = self.ok("menu")
+        self.assertEqual(result.stdout, "Today  nothing counted yet\n")
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"),
+                         [self.notification("Today: nothing counted yet", "")])
+
+    def test_today_so_far_asks_the_sampler_to_flush_and_tells_when_it_is_paused(self):
+        self.busy_day()
+        self.sampler(paused=True)
+        self.stubs.choose_in_menu("Today so far")
+        # A paused sampler is offered resume, but today is shown all the same.
+        result = self.ok("menu")
+        self.assertEqual(result.stdout.splitlines(), [TODAY + " (paused)"] + TODAY_ROWS)
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"),
+                         [self.notification("Today: 3h 07m", TODAY_BODY + " \u00b7 counting is paused")])
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS, STATUS, FLUSH])
+
+    def test_pause_counting_does_what_pause_notify_does(self):
+        # The sampler counts when the menu opens and has paused by the time it is asked again.
+        self.samplers({}, {"paused": True})
+        self.stubs.choose_in_menu("Pause counting")
+        result = self.ok("menu", **FAST)
+        self.assertEqual(result.stdout,
+                         "Counting is paused. `omawrapped resume`, or the widget's menu, starts it again.\n")
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [["set", PLUGIN_ID, "paused", "true", "--json"]])
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"),
+                         [self.notification("Counting paused", "Resume it from the widget's menu.")])
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "omarchy-bar", "omarchy-notification-send")
+
+    def test_pause_counting_without_a_sampler_saves_the_setting_and_says_nothing_on_the_desktop(self):
+        self.stubs.choose_in_menu("Pause counting")
+        result = self.ok("menu", **FAST)
+        self.assertEqual(result.stdout, "Saved. The sampler is not running; it will start paused.\n")
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [["set", PLUGIN_ID, "paused", "true", "--json"]])
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+
+    def test_pause_counting_that_the_sampler_does_not_follow_fails_as_pause_does(self):
+        self.sampler()
+        self.stubs.choose_in_menu("Pause counting")
+        result = self.run_cli("menu", **FAST)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NOT_FOLLOWED))
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+
+    def test_pause_counting_without_omarchy_bar_fails_as_pause_does(self):
+        self.stubs.remove("omarchy-bar")
+        self.stubs.choose_in_menu("Pause counting")
+        result = self.run_cli("menu")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "omarchy-bar was not found, so the pause could not be saved. "
+                                        "It is part of Omarchy 4.\n")
+
+    def test_resume_counting_does_what_resume_notify_does(self):
+        self.samplers({"paused": True}, {"paused": False})
+        self.stubs.choose_in_menu("Resume counting")
+        result = self.ok("menu", **FAST)
+        self.assertEqual(result.stdout, "Counting again.\n")
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [["set", PLUGIN_ID, "paused", "false", "--json"]])
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification("Counting again", "")])
+        self.assert_nothing_started("omarchy-menu-select", "omarchy-shell", "omarchy-bar", "omarchy-notification-send")
+
+    def test_resume_counting_that_the_sampler_does_not_follow_fails_as_resume_does(self):
+        self.sampler(paused=True)
+        self.stubs.choose_in_menu("Resume counting")
+        result = self.run_cli("menu", **FAST)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NOT_FOLLOWED))
+        self.assertEqual(self.stubs.argv("omarchy-notification-send"), [])
+
+    def test_the_other_entries_leave_the_setting_alone(self):
+        self.record()
+        self.make_card()
+        for label in ("Today so far", "Copy card", "Show in folder"):
+            self.stubs.choose_in_menu(label)
+            self.ok("menu")
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [])
 
     def test_copy_card_copies_the_newest_card_and_says_so(self):
         self.make_card("omawrapped-2026-10-09.png", mtime=1000)
@@ -1135,13 +1859,13 @@ class MenuTests(CliCase):
         self.assertEqual(self.stubs.stdin("wl-copy"), newest.read_bytes())
         self.assertEqual(self.stubs.argv("omarchy-notification-send"), [self.notification(
             "Card copied", "omawrapped-2026-10-02.png is on the clipboard. Paste it anywhere.", image=newest)])
-        self.assert_nothing_started("omarchy-menu-select", "wl-copy", "omarchy-notification-send")
+        self.assert_only_asked("wl-copy", "omarchy-notification-send")
 
     def test_copy_card_without_a_card_fails_as_copy_does(self):
         self.stubs.choose_in_menu("Copy card")
         result = self.run_cli("menu")
         self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", NO_CARD + "\n"))
-        self.assert_nothing_started("omarchy-menu-select")
+        self.assert_only_asked()
 
     def test_copy_card_with_a_failing_wl_copy_fails_as_copy_does(self):
         self.make_card()
@@ -1149,7 +1873,7 @@ class MenuTests(CliCase):
         self.stubs.choose_in_menu("Copy card")
         result = self.run_cli("menu")
         self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", COPY_FAILED + "\n"))
-        self.assert_nothing_started("omarchy-menu-select", "wl-copy")
+        self.assert_only_asked("wl-copy")
 
     def test_show_in_folder_shows_the_newest_card(self):
         self.make_card("omawrapped-2026-10-09.png", mtime=1000)
@@ -1158,7 +1882,7 @@ class MenuTests(CliCase):
         result = self.ok("menu")
         self.assertEqual(result.stdout, str(newest) + "\n")
         self.assertEqual(self.stubs.wait_for_argv("uwsm-app"), [["--", "nautilus", "--select", str(newest)]])
-        self.assert_nothing_started("omarchy-menu-select", "uwsm-app")
+        self.assert_only_asked("uwsm-app")
 
     def test_show_in_folder_without_a_card_or_a_file_manager_fails_as_show_does(self):
         self.stubs.choose_in_menu("Show in folder")
@@ -1226,7 +1950,8 @@ class MenuTests(CliCase):
         self.sampler()
         self.stubs.choose_in_menu("Card of the last 7 days")
         self.ok("menu")
-        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " status", PLUGIN_ID + " flush"])
+        # The menu asked once to build its last entry, the card once more to find out whether to flush.
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [STATUS, STATUS, FLUSH])
 
     @needs_renderer
     def test_a_viewer_that_is_not_there_is_a_warning_not_a_failure(self):
@@ -1274,6 +1999,29 @@ class StatusTests(CliCase):
                 self.sampler(**reply)
                 self.assertIn("Sampler   " + expected, self.ok("status").stdout)
 
+    def test_a_paused_sampler_is_paused_by_you_and_that_beats_the_other_two_reasons(self):
+        paused = ("Sampler   running, paused by you (`omawrapped resume` starts it again); "
+                  "away after 120s without input; today 0m")
+        for fields in ({"counting": False}, {"counting": True}, {"counting": False, "locked": True},
+                       {"counting": True, "locked": True}, {}):
+            with self.subTest(fields=fields):
+                self.sampler(paused=True, **fields)
+                self.assertIn(paused, self.ok("status").stdout.splitlines())
+
+    def test_a_sampler_that_is_not_paused_says_what_it_did_before(self):
+        self.sampler(paused=False, counting=False, locked=True)
+        self.assertIn("Sampler   running, paused (session locked); away after 120s without input; today 0m",
+                      self.ok("status").stdout.splitlines())
+        self.sampler(paused=False)
+        self.assertIn("Sampler   running, counting; away after 120s without input; today 0m",
+                      self.ok("status").stdout.splitlines())
+
+    def test_the_pause_of_a_sampler_that_records_elsewhere_is_not_reported(self):
+        self.sampler(paused=True, dataDir="/somewhere/else/omawrapped")
+        out = self.ok("status").stdout
+        self.assertIn("Sampler   running, but recording to /somewhere/else/omawrapped, not the folder above", out)
+        self.assertNotIn("paused by you", out)
+
     def test_a_sampler_recording_elsewhere_is_named_as_such(self):
         self.sampler(dataDir="/somewhere/else/omawrapped")
         self.assertIn("Sampler   running, but recording to /somewhere/else/omawrapped, not the folder above",
@@ -1304,9 +2052,9 @@ class StatusTests(CliCase):
     def test_the_new_lines_follow_the_clipboard_line_in_this_order(self):
         lines = self.status_lines()
         first = next(number for number, line in enumerate(lines) if line.startswith("Clipboard"))
-        self.assertEqual(lines[first:first + 4], [
+        self.assertEqual(lines[first:first + 5], [
             "Clipboard wl-copy found", "Notify    omarchy-notification-send found",
-            "Menu      omarchy-menu-select found", "Files     nautilus found"])
+            "Menu      omarchy-menu-select found", "Pause     omarchy-bar found", "Files     nautilus found"])
 
     def test_the_notification_tool(self):
         self.assertIn("Notify    omarchy-notification-send found", self.status_lines())
@@ -1323,6 +2071,11 @@ class StatusTests(CliCase):
         self.assertIn("Menu      omarchy-menu-select found", self.status_lines())
         self.stubs.remove("omarchy-menu-select")
         self.assertIn("Menu      MISSING (the widget's middle-click menu needs Omarchy's menu)", self.status_lines())
+
+    def test_the_pause_tool(self):
+        self.assertIn("Pause     omarchy-bar found", self.status_lines())
+        self.stubs.remove("omarchy-bar")
+        self.assertIn("Pause     MISSING (pausing needs Omarchy's bar command)", self.status_lines())
 
     def test_the_file_manager(self):
         self.assertIn("Files     nautilus found", self.status_lines())
@@ -1344,6 +2097,7 @@ class StatusTests(CliCase):
         for expected in ("Clipboard wl-copy MISSING (package wl-clipboard)",
                          "Notify    MISSING (no notifications; results are still printed)",
                          "Menu      MISSING (the widget's middle-click menu needs Omarchy's menu)",
+                         "Pause     MISSING (pausing needs Omarchy's bar command)",
                          "Files     MISSING"):
             self.assertIn(expected, lines)
 
@@ -1370,6 +2124,24 @@ class StatusTests(CliCase):
 
     def test_default_repository_folders(self):
         self.assertIn("0 repositories under ~/projects, ~/code", self.ok("status").stdout)
+
+    def test_without_a_repository_the_git_line_says_where_the_folders_are_set(self):
+        self.assertIn("Git       found; 0 repositories under ~/projects, ~/code "
+                      "(the widget's repoDirs setting says where to look)", self.ok("status").stdout.splitlines())
+        # Without git it is still the folders that are wrong, or the git that is missing: both are said.
+        self.assertIn("Git       MISSING (package git); 0 repositories under ~/projects, ~/code "
+                      "(the widget's repoDirs setting says where to look)",
+                      self.ok("status", PATH=str(self.stubs.dir)).stdout.splitlines())
+
+    def test_with_repositories_the_git_line_has_no_hint(self):
+        repos = self.tmp / "repos"
+        init_repo(repos / "first")
+        self.write(self.config / "omarchy" / "shell.json", json.dumps({"version": 1, "bar": {"layout": {"right": [
+            {"id": PLUGIN_ID, "repoDirs": str(repos)}]}}}))
+        self.assertIn("Git       found; 1 repository under %s" % repos, self.ok("status").stdout.splitlines())
+        init_repo(repos / "second")
+        self.assertIn("Git       found; 2 repositories under %s" % repos, self.ok("status").stdout.splitlines())
+        self.assertNotIn("repoDirs", self.ok("status").stdout)
 
     def test_reading_the_status_writes_nothing(self):
         self.ok("status")
@@ -1522,6 +2294,7 @@ class IsolationTests(CliCase):
 
     def test_every_command_only_ever_reached_the_stand_ins(self):
         self.record()
+        self.busy_day()
         self.sampler()
         repos = self.tmp / "repos"
         self.repo_with_commits(repos)
@@ -1534,16 +2307,43 @@ class IsolationTests(CliCase):
         self.ok("show")
         self.ok("show", self.tmp / "c.svg")
         self.ok("menu")
-        for label in ("Copy card", "Show in folder"):
+        for label in ("Copy card", "Show in folder", "Today so far"):
             self.stubs.choose_in_menu(label)
             self.ok("menu")
+        self.ok("today")
+        self.ok("today", "--notify")
+        # The sampler follows each of these as it is told: it is paused when `pause` looks, counting for `resume`.
+        self.sampler(paused=True)
+        self.ok("pause", "--notify", **FAST)
+        self.sampler()
+        self.ok("resume", "--notify", **FAST)
+        # The menu offers what suits the sampler as it is when it opens; the sampler has followed at the next look.
+        self.samplers({}, {"paused": True})
+        self.stubs.choose_in_menu("Pause counting")
+        self.ok("menu", **FAST)
+        self.samplers({"paused": True}, {"paused": False})
+        self.stubs.choose_in_menu("Resume counting")
+        self.ok("menu", **FAST)
+        self.sampler()
         self.ok("reset", "--yes")
         self.stubs.wait_for_argv("xdg-open")
         deadline = time.monotonic() + 5
         while len(self.stubs.argv("uwsm-app")) < 3 and time.monotonic() < deadline:
             time.sleep(0.05)
-        status, flush, discard = (PLUGIN_ID + " " + method for method in ("status", "flush", "discard"))
-        self.assertEqual(self.stubs.calls("omarchy-shell"), [status, flush, status, status, flush, status, discard])
+        status, flush, discard = STATUS, FLUSH, PLUGIN_ID + " discard"
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [
+            status, flush,                   # stats
+            status,                          # status
+            status, flush,                   # card
+            status, status, status,          # the menu: dismissed, then copy and show
+            status, status, flush,           # the menu: today so far
+            status, flush, status, flush,    # today, today --notify
+            status, status,                  # pause, resume
+            status, status, status, status,  # the menu: pause counting, resume counting
+            status, discard])                # reset
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [
+            ["set", PLUGIN_ID, "paused", "true", "--json"], ["set", PLUGIN_ID, "paused", "false", "--json"],
+            ["set", PLUGIN_ID, "paused", "true", "--json"], ["set", PLUGIN_ID, "paused", "false", "--json"]])
         self.assertEqual(self.stubs.argv("wl-copy"), [
             ["--", str(self.tmp / "c.svg")], ["--type", "image/png"], ["--type", "image/svg+xml"],
             ["--type", "image/png"]])
@@ -1555,8 +2355,14 @@ class IsolationTests(CliCase):
             self.notification("Card saved", "Its path is on the clipboard. " + CLICK_HINT,
                               click=[str(LAUNCHER), "show", str(self.tmp / "c.svg")]),
             self.notification("Card copied", "%s is on the clipboard. Paste it anywhere." % card.name, image=card),
-            self.notification("Card copied", "%s is on the clipboard. Paste it anywhere." % card.name, image=card)])
-        self.assertEqual(len(self.stubs.argv("omarchy-menu-select")), 3)
+            self.notification("Card copied", "%s is on the clipboard. Paste it anywhere." % card.name, image=card),
+            self.notification("Today: 3h 07m", TODAY_BODY),
+            self.notification("Today: 3h 07m", TODAY_BODY),
+            self.notification("Counting paused", "Resume it from the widget's menu."),
+            self.notification("Counting again", ""),
+            self.notification("Counting paused", "Resume it from the widget's menu."),
+            self.notification("Counting again", "")])
+        self.assertEqual(len(self.stubs.argv("omarchy-menu-select")), 6)
         # Nothing but the stand-ins can have been reached, so nothing else was.
         self.assertEqual(self.stubs.argv("nautilus"), [])
         self.assertEqual(self.stubs.argv("notify-send"), [])

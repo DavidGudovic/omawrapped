@@ -19,6 +19,7 @@ ShellRoot {
   QtObject {
     id: fakeService
     property bool ready: true
+    property bool paused: false
     property real todayMs: 3 * 3600000 + 7 * 60000
   }
 

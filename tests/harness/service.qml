@@ -13,6 +13,7 @@ ShellRoot {
   readonly property int toleranceMs: 200
 
   property var service: null
+  property real beforePause: 0
   property var failures: []
   property int step: 0
   property string today: ""
@@ -25,14 +26,19 @@ ShellRoot {
       return null
     }
     // Away until the script says otherwise, so that nothing is counted
-    // between the service coming up and the first step. The settings arrive
-    // the way the host hands them over: in the bar layout on its facade.
+    // between the service coming up and the first step.
     return component.createObject(null, {
-      shell: { barConfig: { layout: { left: [], right: [{ id: "other.plugin" }, {
-        id: "io.github.davidgudovic.omawrapped", idleSeconds: 45,
-        ignoreApps: "Secret, other, chrome-private.example.com__-Default" }] } } },
-      pollLock: false, focusedApp: "", userIdle: true, sessionLocked: false
+      shell: shellWith({}), pollLock: false, focusedApp: "", userIdle: true, sessionLocked: false
     })
+  }
+
+  // The settings as the host hands them over: in the bar layout on its
+  // facade. A change of settings is a new facade with a new layout.
+  function shellWith(more) {
+    var entry = { id: "io.github.davidgudovic.omawrapped", idleSeconds: 45,
+      ignoreApps: "Secret, other, chrome-private.example.com__-Default" }
+    for (var key in more) entry[key] = more[key]
+    return { barConfig: { layout: { left: [], right: [{ id: "other.plugin" }, entry] } } }
   }
 
   function readText() {
@@ -154,6 +160,23 @@ ShellRoot {
       var day = readDay()
       near("active ms after the folder vanished", day ? day.active_ms : null, 1300)
       near("todayMs follows the disk", service.todayMs, 1300)
+      equal("not paused unless the setting says so", JSON.parse(service.statusJson()).paused, false)
+      // The user pauses: the setting arrives, and counting stops with it.
+      harness.beforePause = day ? day.active_ms : 0
+      service.shell = shellWith({ paused: true })
+    }],
+    [1000, function() {
+      service.flush()
+      var day = readDay()
+      var status = JSON.parse(service.statusJson())
+      equal("the setting pauses the service", service.paused, true)
+      equal("status says paused, and not counting", status.paused === true && status.counting === false, true)
+      equal("nothing is counted while paused", day ? day.active_ms : null, harness.beforePause)
+      // "true" is what `omarchy bar set` stores when it is not told the value is JSON.
+      service.shell = shellWith({ paused: "true" })
+      equal("the word true pauses as well", service.paused, true)
+      service.shell = shellWith({})
+      equal("and without the setting it counts again", JSON.parse(service.statusJson()).counting, true)
     }],
     // One more second that nobody flushes: the shell closing must write it.
     // tests/harness.sh reads the file once this process is gone.

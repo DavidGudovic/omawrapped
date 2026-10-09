@@ -453,7 +453,8 @@ class StandInTests(ShareCase):
     """The stand-ins are what keeps every other test away from the desktop, so they are tested too."""
 
     def test_every_desktop_program_is_a_stand_in_and_nothing_else_is_on_the_path(self):
-        self.assertEqual(len(STUBBED), 8)
+        self.assertEqual(len(STUBBED), 9)
+        self.assertIn("omarchy-bar", STUBBED)
         for name in STUBBED:
             self.assertEqual(shutil.which(name), str(self.stubs.dir / name))
         for folder in os.environ["PATH"].split(":"):
@@ -487,6 +488,72 @@ class StandInTests(ShareCase):
         done = subprocess.run([str(self.stubs.dir / "nautilus"), "--select", "x"], env={})
         self.assertEqual(done.returncode, 3)
         self.assertEqual(self.stubs.argv("nautilus"), [["--select", "x"]])
+
+    def test_a_stand_in_says_why_it_failed_when_given_a_reason(self):
+        failing = self.stubs.dir / "nautilus"
+        self.stubs.fail("nautilus", 3, reason="no folder")
+        done = subprocess.run([str(failing), "x"], capture_output=True, text=True, env={})
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (3, "", "no folder\n"))
+        self.stubs.fail("nautilus", 4, reason="two\nlines\n")
+        done = subprocess.run([str(failing)], capture_output=True, text=True, env={})
+        self.assertEqual((done.returncode, done.stderr), (4, "two\nlines\n"))
+        self.assertEqual(self.stubs.argv("nautilus"), [["x"], []])
+
+    def test_omarchy_bar_reports_a_change_as_omarchy_does(self):
+        bar = str(self.stubs.dir / "omarchy-bar")
+        done = subprocess.run([bar, "set", "some.widget", "paused", "true", "--json"], capture_output=True, text=True,
+                              env={})
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "Set paused on some.widget\n", ""))
+        done = subprocess.run([bar, "set", "other.widget", "idleSeconds", "30", "--json"], capture_output=True,
+                              text=True, env={})
+        self.assertEqual(done.stdout, "Set idleSeconds on other.widget\n")
+        done = subprocess.run([bar, "list"], capture_output=True, text=True, env={})
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "", ""))
+        self.assertEqual(self.stubs.argv("omarchy-bar"), [["set", "some.widget", "paused", "true", "--json"],
+                                                          ["set", "other.widget", "idleSeconds", "30", "--json"],
+                                                          ["list"]])
+
+    def test_omarchy_bar_that_fails_always_says_why_unless_told_to_say_nothing(self):
+        bar = str(self.stubs.dir / "omarchy-bar")
+        self.stubs.fail("omarchy-bar", 2)
+        done = subprocess.run([bar, "set", "w", "paused", "true", "--json"], capture_output=True, text=True, env={})
+        self.assertEqual((done.returncode, done.stdout), (2, ""))
+        self.assertTrue(done.stderr.strip())
+        self.assertEqual(len(done.stderr.splitlines()), 1)
+        self.stubs.fail("omarchy-bar", 2, reason="Unknown widget: w")
+        done = subprocess.run([bar, "set", "w", "paused", "true", "--json"], capture_output=True, text=True, env={})
+        self.assertEqual(done.stderr, "Unknown widget: w\n")
+        self.stubs.fail("omarchy-bar", 2, reason="")
+        done = subprocess.run([bar, "set", "w", "paused", "true", "--json"], capture_output=True, text=True, env={})
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (2, "", ""))
+        self.assertEqual(len(self.stubs.argv("omarchy-bar")), 3)
+
+    def test_the_shell_answers_status_differently_on_successive_calls_when_told_to(self):
+        shell = str(self.stubs.dir / "omarchy-shell")
+
+        def ask(method="status"):
+            return subprocess.run([shell, "plugin", method], capture_output=True, text=True, env={}, check=True).stdout
+
+        self.stubs.reply_to_status_in_turn('{"n": 1}', "", '{"n": 3}')
+        self.assertEqual([ask() for _ in range(5)], ['{"n": 1}', "", '{"n": 3}', '{"n": 3}', '{"n": 3}'])
+        # Other methods are not counted, and giving the replies again starts again.
+        self.stubs.reply_to_status_in_turn('{"n": 1}', '{"n": 2}')
+        self.assertEqual(ask("flush"), "ok\n")
+        self.assertEqual([ask(), ask(), ask()], ['{"n": 1}', '{"n": 2}', '{"n": 2}'])
+        # One reply for every call is the way it was, and wins over the ones in turn until they are given again.
+        self.stubs.reply_to_status('{"n": 0}')
+        self.assertEqual([ask(), ask()], ['{"n": 0}', '{"n": 0}'])
+        self.stubs.reply_to_status_in_turn("a")
+        self.assertEqual(ask(), "a")
+        with self.assertRaises(ValueError):
+            self.stubs.reply_to_status_in_turn("two\nlines")
+
+    def test_a_harmless_tool_can_be_replaced_by_a_stand_in_that_logs_its_calls(self):
+        self.stubs.replace_tool("git")
+        self.assertEqual(shutil.which("git"), str(self.stubs.tools / "git"))
+        subprocess.run(["git", "status", "-s"], check=True, env={"PATH": os.environ["PATH"]})
+        self.assertEqual(self.stubs.argv("git"), [["status", "-s"]])
+        self.assertNotIn("git", STUBBED)
 
     def test_the_shell_answers_as_the_sampler_does(self):
         shell = str(self.stubs.dir / "omarchy-shell")

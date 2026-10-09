@@ -12,7 +12,7 @@ import "Tracker.js" as Tracker
 //
 //   left click    the card of the last 7 days
 //   right click   the card of the last 30 days
-//   middle click  Omarchy's menu, to copy the last card or show its folder
+//   middle click  Omarchy's menu: today so far, the last card, a pause
 //
 // A card is opened, put on the clipboard as a picture and announced by the
 // command itself. Only what goes wrong is reported from here.
@@ -30,13 +30,18 @@ BarWidget {
   // icons: a card with a chart in it. U+F154D, written as its two halves.
   readonly property string glyph: "󱕍"
   readonly property string today: live ? Tracker.formatDuration(service.todayMs) : ""
+  // The user paused the counting, in the menu or in the settings.
+  readonly property bool paused: live && service.paused === true
+  // What stands beside the icon: nothing while the service is starting.
+  readonly property string caption: !live ? "" : (paused ? "paused" : today)
   readonly property string command: decodeURIComponent(String(Qt.resolvedUrl("bin/omawrapped")).replace(/^file:\/\//, ""))
   readonly property bool busy: card.pending
 
   readonly property string tooltip: {
     if (busy) return "Drawing your card…"
     if (!live) return "OmaWrapped is starting…"
-    return today + " of screen time today · click: week card · right: month card · middle: copy or show it"
+    if (paused) return "Counting is paused at " + today + " today · middle click: resume, and more"
+    return today + " of screen time today · click: week card · right: month card · middle: more"
   }
 
   function report(problem) {
@@ -90,8 +95,8 @@ BarWidget {
     anchors.fill: parent
     visible: root.showTime
     bar: root.bar
-    text: root.today === "" ? root.glyph : root.glyph + " " + root.today
-    dimmed: root.busy
+    text: root.caption === "" ? root.glyph : root.glyph + " " + root.caption
+    dimmed: root.busy || root.paused
     tooltipText: root.tooltip
     onPressed: function(button) { root.handlePress(button) }
   }
@@ -102,7 +107,7 @@ BarWidget {
     visible: !root.showTime
     bar: root.bar
     text: root.glyph
-    dimmed: root.busy
+    dimmed: root.busy || root.paused
     tooltipText: root.tooltip
     onPressed: function(button) { root.handlePress(button) }
   }

@@ -35,6 +35,10 @@ Item {
 
   readonly property var entry: Tracker.entryFor(shell ? shell.barConfig : null, pluginId)
   readonly property int idleSeconds: boundedInt(entry.idleSeconds, 120, 30, 3600)
+  // The user's own switch: nothing is counted while it is on. It is a
+  // setting, so that it survives a restart and keeps the other settings,
+  // which disabling the plugin would not.
+  readonly property bool paused: entry.paused === true || entry.paused === "true"
   // A playing video or a call keeps the session from going idle. That is
   // screen time, unless the user says otherwise.
   readonly property bool countKeptAwake: entry.countKeptAwake !== false && entry.countKeptAwake !== "false"
@@ -54,8 +58,8 @@ Item {
   property bool sessionLocked: Tracker.anyLocked(monitorBlockers())
   property bool pollLock: true
 
-  // Nothing is counted while the user is idle, the session is locked, or
-  // an ignored app has focus.
+  // Nothing is counted while counting is paused, the user is idle, the
+  // session is locked, or an ignored app has focus.
   readonly property bool away: isAway()
 
   // ---- For the bar widget ----
@@ -139,7 +143,7 @@ Item {
   }
 
   function isAway() {
-    return userIdle || sessionLocked || ignoredKeys.indexOf(Tracker.ignoreKey(focusedApp)) !== -1
+    return paused || userIdle || sessionLocked || ignoredKeys.indexOf(Tracker.ignoreKey(focusedApp)) !== -1
   }
 
   // Closes the running stretch under the conditions it ran with and starts
@@ -214,6 +218,7 @@ Item {
   function statusJson() {
     return JSON.stringify({
       counting: _ready && !away,
+      paused: paused,
       locked: sessionLocked,
       idleSeconds: idleSeconds,
       countKeptAwake: countKeptAwake,
@@ -235,6 +240,7 @@ Item {
   onUserIdleChanged: sessionChanged()
   onSessionLockedChanged: observe()
   onIgnoredKeysChanged: observe()
+  onPausedChanged: observe()
   // Walking away is the moment before the screen locks, the machine sleeps
   // or the session ends: what was counted goes to disk now, not at the
   // next minute.
