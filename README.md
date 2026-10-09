@@ -10,7 +10,7 @@ The widget as the bar draws it, enlarged.
 
 OmaWrapped is a plugin for the Omarchy shell. It has two parts:
 
-- **A bar widget** that shows today's screen time. Click it for a card of the last 7 days, right click for the last 30. The card is opened, put on the clipboard as a picture and announced. A middle click offers to copy the last card again or show it in its folder.
+- **A bar widget** that shows today's screen time. Click it for a card of the last 7 days, right click for the last 30. The card is opened, put on the clipboard as a picture and announced. A middle click opens a menu: today so far, the last card, and a pause.
 - **An `omawrapped` command** that draws the card, copies or shows it, prints the numbers behind it, and wipes the data.
 
 Everything is counted on your machine and stays there. OmaWrapped makes no network requests, and it never looks at window titles. See [Privacy](#privacy) for exactly what is stored.
@@ -24,7 +24,9 @@ omarchy plugin add https://github.com/DavidGudovic/omawrapped.git
 omarchy plugin enable io.github.davidgudovic.omawrapped
 ```
 
-`add` clones this repository to `~/.config/omarchy/plugins/io.github.davidgudovic.omawrapped/` and leaves the plugin switched off, so you can read the code first. `enable` puts the widget in the right section of the bar and starts the counting.
+`add` clones this repository to `~/.config/omarchy/plugins/io.github.davidgudovic.omawrapped/` and leaves the plugin switched off, so you can read the code first. `enable` puts the widget in the right section of the bar, next to the tray, and starts the counting.
+
+The widget is a chart icon with today's screen time beside it. Drag it to where you want it, like any other bar widget.
 
 The widget is all you need. To also run `omawrapped` from a terminal, link the command into a folder on your `PATH`:
 
@@ -34,22 +36,15 @@ ln -s ~/.config/omarchy/plugins/io.github.davidgudovic.omawrapped/bin/omawrapped
 
 Counting starts when you enable the plugin; there is no history from before that. The bar starts at `0m`. A card can be drawn once a minute has been recorded, and is worth making after a day or two.
 
-### What it needs
+To update later:
 
-Everything below ships with Omarchy, so there is normally nothing to add. `omawrapped status` tells you if something is missing.
+```bash
+omarchy plugin update io.github.davidgudovic.omawrapped
+```
 
-| Package | Used for | Without it |
-|---|---|---|
-| `python` 3.11 or later | the `omawrapped` command | no card; the widget still counts |
-| `librsvg` (`rsvg-convert`) | turning the drawing into a PNG | `omawrapped card -o card.svg` still works |
-| `python-gobject` with Pango | measuring text so nothing overflows | widths are estimated for a monospace font |
-| `wl-clipboard` (`wl-copy`) | copying the card or its path | nothing is copied; the card is still saved |
-| `xdg-utils` (`xdg-open`) | opening the card after a click | the card is saved but not opened |
-| `omarchy-notification-send` (part of Omarchy; `notify-send` otherwise) | saying that the card is ready | nothing is announced |
-| `omarchy-menu-select` (part of Omarchy) | the middle-click menu | no menu; `omawrapped copy` and `omawrapped show` still work |
-| `nautilus` | showing the card in its folder | the folder is opened with `xdg-open`, the card not selected |
-| `git` | counting your commits | the card has no commit count |
-| `fontconfig` (`fc-match`) | finding your monospace font | the generic `monospace` is used |
+Omarchy shows what changed and asks before it applies anything.
+
+OmaWrapped needs nothing that Omarchy does not already ship. [What it needs](#what-it-needs) lists each tool and what happens without it.
 
 ## Use
 
@@ -58,10 +53,13 @@ Click the widget, or:
 ```bash
 omawrapped card              # last 7 days -> ~/Pictures/omawrapped-2026-10-09.png, path copied
 omawrapped card --month      # last 30 days -> ~/Pictures/omawrapped-2026-10-09-month.png
-omawrapped card --days 14    # any number of days, today included
+omawrapped card --days 14    # any number of days, today included (--today for today alone)
+omawrapped today             # today's screen time and top apps, without drawing a card
 omawrapped copy              # the last card's picture -> clipboard
 omawrapped show              # the last card, selected in the file manager
 omawrapped menu              # the same choices in Omarchy's menu (what a middle click does)
+omawrapped pause             # stop counting until you resume
+omawrapped resume            # count again
 omawrapped stats             # the same numbers as text; add --json for scripts
 omawrapped status            # what is stored, whether the sampler runs, what it ignores, what is installed
 omawrapped reset             # delete everything that was recorded
@@ -87,18 +85,28 @@ A left or right click on the widget draws the card and does four things at once.
 
 A middle click opens Omarchy's own menu:
 
-- **Copy card**
-- **Show in folder**
-- **Card of the last 7 days**
-- **Card of the last 30 days**
+- **Today so far**: today's screen time and its top three apps, as a notification. Nothing is drawn and the clipboard is left alone.
+- **Card of the last 7 days** and **Card of the last 30 days**: what a left and a right click do.
+- **Copy card** and **Show in folder**: for the newest card in the Pictures folder.
+- **Pause counting**, or **Resume counting** while it is paused.
 
-"Copy card" and "Show in folder" act on the newest card in the Pictures folder. If there is none yet, a notification says so.
+If there is no card yet, "Copy card" and "Show in folder" say so in a notification.
 
 From a terminal, `omawrapped copy` copies the last card, `omawrapped show` shows it in its folder, and `omawrapped menu` opens the same menu. `omawrapped card` run from a terminal copies the card's path by default; `--copy image` copies the picture instead, and `--notify` announces it.
 
 If a tool is missing, the command names it and carries on. Without `wl-copy`, nothing is copied, but the card is still saved and opened. Without Nautilus, "Show in folder" opens the folder without selecting the card. Without Omarchy's menu, a middle click reports that; `omawrapped copy` and `omawrapped show` still work.
 
 There is no screenshot of the menu or the notification here: the Omarchy shell draws both, so they need a running desktop to capture.
+
+### Pausing
+
+"Pause counting" in the menu, or `omawrapped pause`, stops the counting until you resume. Nothing is recorded meanwhile.
+
+While paused, the widget is dimmed and shows `paused` in place of the time. "Resume counting" in the same menu, or `omawrapped resume`, starts it again.
+
+The pause is a setting, `paused`, on the widget's bar entry. It is changed through Omarchy's own `omarchy bar set`, so it survives a restart of the shell or the machine.
+
+Unlike `omarchy plugin disable`, a pause keeps your other settings.
 
 ### Settings
 
@@ -115,6 +123,7 @@ omarchy bar set io.github.davidgudovic.omawrapped countKeptAwake false
 | Setting | Default | Meaning |
 |---|---|---|
 | `display` | `time` | `time` shows today's screen time beside the icon, `icon` the icon alone. A vertical bar always shows the icon alone. |
+| `paused` | `false` | Nothing is counted while it is `true`. "Pause counting" in the menu and `omawrapped pause` set it. |
 | `idleSeconds` | `120` | Counting stops once you have not touched the keyboard or mouse for this long (30 to 3600). |
 | `countKeptAwake` | `true` | Whether time counts while a video or call keeps the screen awake without any input. `false` counts keyboard and mouse activity only. |
 | `ignoreApps` | empty | Window classes that are never recorded, comma-separated, in any case. `hyprctl clients` shows the class of every open window. |
@@ -145,6 +154,24 @@ The last 30 days, in the Matte Black theme.
 The last 7 days in Catppuccin Latte: the card takes its colours from whichever theme is active.
 
 Every picture in this README is real output. `tests/screenshots.sh` draws them from the code in a temporary home: the cards with the `omawrapped` command from the sample days of `tests/make_sample.py`, the widget from `BarWidget.qml` with a stand-in for the bar around it. None of them shows anyone's real data.
+
+## What it needs
+
+Everything below ships with Omarchy, so there is normally nothing to add. `omawrapped status` tells you if something is missing.
+
+| Package | Used for | Without it |
+|---|---|---|
+| `python` 3.11 or later | the `omawrapped` command | no card; the widget still counts |
+| `librsvg` (`rsvg-convert`) | turning the drawing into a PNG | `omawrapped card -o card.svg` still works |
+| `python-gobject` with Pango | measuring text so nothing overflows | widths are estimated for a monospace font |
+| `wl-clipboard` (`wl-copy`) | copying the card or its path | nothing is copied; the card is still saved |
+| `xdg-utils` (`xdg-open`) | opening the card after a click | the card is saved but not opened |
+| `omarchy-notification-send` (part of Omarchy; `notify-send` otherwise) | saying that the card is ready | nothing is announced |
+| `omarchy-menu-select` (part of Omarchy) | the middle-click menu | no menu; `omawrapped copy` and `omawrapped show` still work |
+| `omarchy-bar` (part of Omarchy) | pausing, and changing the settings | no pause; the widget still counts |
+| `nautilus` | showing the card in its folder | the folder is opened with `xdg-open`, the card not selected |
+| `git` | counting your commits | the card has no commit count |
+| `fontconfig` (`fc-match`) | finding your monospace font | the generic `monospace` is used |
 
 ## How it counts, and what that costs
 
@@ -215,12 +242,12 @@ rm -f ~/.local/bin/omawrapped                             # the link, if you mad
 
 Run them in this order: the service writes its last minute as it stops, so the data folder goes after the plugin. Nothing else is left behind. Saved cards stay in your Pictures folder until you delete them.
 
-To pause instead, `omarchy plugin disable io.github.davidgudovic.omawrapped` stops the counting and keeps what was recorded. It does not keep your settings: Omarchy stores a widget's settings on its bar entry and removes the entry when the widget is disabled. After enabling it again, set `ignoreApps` and the others again before you rely on them; `omawrapped status` shows what is in effect.
+To stop counting for a while without removing anything, pause it: see [Pausing](#pausing). `omarchy plugin disable io.github.davidgudovic.omawrapped` also stops the counting and keeps what was recorded, but it does not keep your settings: Omarchy stores a widget's settings on its bar entry and removes the entry when the widget is disabled. After enabling it again, set `ignoreApps` and the others again before you rely on them; `omawrapped status` shows what is in effect.
 
 ## Good to know
 
 - Only time with the shell running and the plugin enabled is counted.
-- Disabling the widget removes its settings along with its bar entry, `ignoreApps` included.
+- Disabling the widget removes its settings along with its bar entry, `ignoreApps` included. To take a break, pause instead.
 - One window has focus at a time. A video on a second monitor while you work in a terminal counts for the terminal.
 - When the shell starts or reloads its plugins, the compositor's idle timer starts over. If nobody is there at that moment, up to `idleSeconds` are counted once.
 - Lock detection asks Hyprland, the compositor Omarchy runs on.
