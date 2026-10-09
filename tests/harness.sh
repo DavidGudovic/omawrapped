@@ -50,16 +50,17 @@ if grep -a ' WARN' "$RUN/out.txt" | grep -aq -e "$REPO/[A-Za-z]*\.qml" -e "$REPO
 fi
 
 if [ "$CASE" = service ] && [ "$verdict" = PASS ]; then
-  # The data directory must be private to the user.
+  # The data directory must be private to the user, also after the case
+  # has deleted it twice under the running service.
   mode=$(stat -c %a "$RUN/data/omawrapped")
   if [ "$mode" != 700 ]; then echo "harness: data directory mode is $mode, expected 700" >&2; verdict=FAIL; fi
-  # The case ends with a second it never flushes. The file had about 1000 ms
+  # The case ends with a second it never flushes. The file had about 1300 ms
   # before it; the shell closing must have added the rest.
   written=$(jq -r '.active_ms' "$RUN"/data/omawrapped/days/*.json)
-  if [ "$written" -ge 1800 ] && [ "$written" -le 2400 ]; then
-    echo "OW-CHECK ok   written when the shell closed = $written (expected about 2000)"
+  if [ "$written" -ge 2100 ] && [ "$written" -le 2700 ]; then
+    echo "OW-CHECK ok   written when the shell closed = $written (expected about 2300)"
   else
-    echo "harness: $written ms on disk after the shell closed, expected about 2000" >&2; verdict=FAIL
+    echo "harness: $written ms on disk after the shell closed, expected about 2300" >&2; verdict=FAIL
   fi
 fi
 

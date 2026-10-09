@@ -238,13 +238,14 @@ class Stubs:
 
     Each is a /bin/sh script that appends its arguments, one line per call, to
     its own log and exits 0. omarchy-shell can also be given a canned reply to
-    `status`.
+    `status`; it answers "ok" to anything else, as the sampler does.
     """
 
     def __init__(self, root: Path):
         self.dir = root / "stubs"
         self.logs = root / "stublogs"
         self.reply = root / "shell-status-reply"
+        self.deaf = root / "shell-is-deaf"
         self.dir.mkdir()
         self.logs.mkdir()
         for name in STUBBED:
@@ -253,6 +254,8 @@ class Stubs:
             if name == "omarchy-shell":
                 lines.append('[ "$2" = status ] && [ -f %s ] && cat %s' % (shlex.quote(str(self.reply)),
                                                                           shlex.quote(str(self.reply))))
+                # The sampler answers "ok" to flush and discard, unless it has been made deaf.
+                lines.append('[ "$2" != status ] && [ ! -e %s ] && echo ok' % shlex.quote(str(self.deaf)))
             lines.append("exit 0")
             script.write_text("\n".join(lines) + "\n", encoding="utf-8")
             script.chmod(0o755)
@@ -281,6 +284,10 @@ class Stubs:
 
     def reply_to_status(self, text: str) -> None:
         self.reply.write_text(text, encoding="utf-8")
+
+    def stop_answering(self) -> None:
+        """From now on flush and discard get no answer, as from a shell that is hanging."""
+        self.deaf.write_text("", encoding="utf-8")
 
 
 def cli_env(root: Path, stubs: Stubs) -> dict:

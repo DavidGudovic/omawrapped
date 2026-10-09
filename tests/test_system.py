@@ -120,6 +120,13 @@ class ThemeTests(IsolatedCase):
         found = system.theme(folder)
         self.assertEqual((found.background, found.accent), ("#0a0b0c", "#0c0b0a"))
 
+    def test_a_colour_followed_by_a_line_break_is_not_a_colour(self):
+        # The value goes into an SVG attribute as it stands.
+        self.colors(self.state_current / "theme", 'background = "#112233\\n"\nforeground = "#ddeeff"\n')
+        found = system.theme()
+        self.assertEqual(found.background, DEFAULTS.background)
+        self.assertEqual(found.foreground, "#ddeeff")
+
     def test_hex_digits_may_be_upper_case(self):
         folder = self.tmp / "themes" / "caps"
         self.colors(folder, 'background = "#AABBCC"\n')
@@ -362,6 +369,25 @@ def desktop(name, extra="", header="[Desktop Entry]") -> str:
     return "%s\nType=Application\nName=%s\n%s\n" % (header, name, extra)
 
 
+class AppKeyTests(unittest.TestCase):
+    """app_key must agree with appKey in Tracker.js, which decides what is stored."""
+
+    def test_a_web_app_is_keyed_by_its_site_alone(self):
+        self.assertEqual(system.app_key("chrome-web.whatsapp.com__-Default"), "web:web.whatsapp.com")
+        self.assertEqual(system.app_key("chrome-discord.com__channels_@me-Default"), "web:discord.com")
+        self.assertEqual(system.app_key("brave-music.youtube.com__watch-Profile_1"), "web:music.youtube.com")
+        self.assertEqual(system.app_key("chrome-my-team.Example.NET__-Default"), "web:my-team.example.net")
+        self.assertEqual(system.app_key("chrome-docs.example.com__document_d_1AbCdEf_edit-Private_Profile"),
+                         "web:docs.example.com")
+
+    def test_anything_else_is_its_own_key(self):
+        for app in ("chromium", "com.mitchellh.ghostty", "org.gnome.Nautilus", "steam_app_12345", "Google-chrome",
+                    "foo-bar__baz-qux", "chrome-localhost__-Default", "web:x.com", "Ghostty", "Visual Studio Code"):
+            with self.subTest(app=app):
+                self.assertEqual(system.app_key(app), app)
+        self.assertEqual(system.app_key("  slack \n"), "slack")
+
+
 class AppNamesTests(IsolatedCase):
     def setUp(self):
         super().setUp()
@@ -440,6 +466,16 @@ class AppNamesTests(IsolatedCase):
         self.assertEqual(names.name("chrome-web.example.com__-Default"), "web.example.com")
         self.assertEqual(names.name("chrome-app.slack.com__client_T123-Default"), "app.slack.com")
         self.assertEqual(names.name("chrome-Example.ORG__-Default"), "example.org")
+
+    def test_the_key_the_sampler_stores_resolves_like_the_window_class(self):
+        # The sampler stores a web app as web:<host>; older and hand-made data may hold the whole class.
+        self.write(self.apps / "WhatsApp.desktop",
+                   "[Desktop Entry]\nName=WhatsApp\nExec=omarchy-launch-webapp https://web.whatsapp.com/\n")
+        names = self.names()
+        self.assertEqual(names.name("web:web.whatsapp.com"), "WhatsApp")
+        self.assertEqual(names.name("chrome-web.whatsapp.com__-Default"), "WhatsApp")
+        self.assertEqual(names.name("web:www.example.com"), "example.com")
+        self.assertEqual(names.name("web:intranet.example.com"), "intranet.example.com")
 
     def test_a_web_app_entry_for_another_site_does_not_match(self):
         self.write(self.apps / "WhatsApp.desktop",

@@ -29,16 +29,21 @@ ShellRoot {
     // the way the host hands them over: in the bar layout on its facade.
     return component.createObject(null, {
       shell: { barConfig: { layout: { left: [], right: [{ id: "other.plugin" }, {
-        id: "io.github.davidgudovic.omawrapped", idleSeconds: 45, ignoreApps: "secret, other" }] } } },
+        id: "io.github.davidgudovic.omawrapped", idleSeconds: 45,
+        ignoreApps: "Secret, other, chrome-private.example.com__-Default" }] } } },
       pollLock: false, focusedApp: "", userIdle: true, sessionLocked: false
     })
   }
 
-  function readDay() {
+  function readText() {
     var view = fileComponent.createObject(harness, { path: dataDir + "/days/" + today + ".json" })
     var text = view.text()
     view.destroy()
-    try { return JSON.parse(text) } catch (error) { return null }
+    return text
+  }
+
+  function readDay() {
+    try { return JSON.parse(readText()) } catch (error) { return null }
   }
 
   function near(label, actual, expected) {
@@ -60,17 +65,21 @@ ShellRoot {
       equal("nothing counted while away", service.todayMs, 0)
       equal("idleSeconds from the bar layout", service.idleSeconds, 45)
       equal("a kept-awake session counts unless switched off", service.countKeptAwake, true)
-      equal("ignored apps", service.ignoredApps.join(","), "org.omarchy.screensaver,secret,other")
+      equal("ignored apps, as the keys they are matched by", service.ignoredKeys.join(","),
+        "org.omarchy.screensaver,secret,other,web:private.example.com")
       today = Qt.formatDate(new Date(), "yyyy-MM-dd")
       service.focusedApp = "alpha"
       service.userIdle = false
     }],
-    [2000, function() { service.focusedApp = "beta" }],
+    // A web app: its window class holds the site, a path and the profile.
+    [2000, function() { service.focusedApp = "chrome-beta.example.com__docs_d_SECRETDOC_edit-Work" }],
     [1000, function() { service.userIdle = true }],
     [1500, function() { service.userIdle = false }],
     [1000, function() { service.sessionLocked = true }],
     [1000, function() { service.sessionLocked = false; service.focusedApp = "org.omarchy.screensaver" }],
-    [1000, function() { service.focusedApp = "secret" }],
+    // Ignored apps: one typed in another case, one a web app on another page.
+    [500, function() { service.focusedApp = "secret" }],
+    [500, function() { service.focusedApp = "chrome-private.example.com__inbox-Default" }],
     [1000, function() { service.focusedApp = "" }],
     [1000, function() { service.focusedApp = "alpha" }],
     [1500, function() {
@@ -81,9 +90,12 @@ ShellRoot {
       equal("version", day.version, 1)
       equal("date", day.date, today)
       near("alpha ms", day.apps_ms.alpha, 3500)
-      near("beta ms", day.apps_ms.beta, 2000)
+      near("the web app, under its site", day.apps_ms["web:beta.example.com"], 2000)
+      var text = readText()
+      equal("no path, profile or ignored site in the file",
+        /SECRETDOC|Work|docs_d|private\.example|inbox/.test(text), false)
       equal("screensaver not recorded", day.apps_ms["org.omarchy.screensaver"], undefined)
-      equal("ignored app not recorded", day.apps_ms.secret, undefined)
+      equal("ignored apps not recorded", Object.keys(day.apps_ms).sort().join(","), "alpha,web:beta.example.com")
       equal("apps recorded", Object.keys(day.apps_ms).length, 2)
       near("active ms", day.active_ms, 6500)
       equal("switches", day.switches, 2)
@@ -118,27 +130,30 @@ ShellRoot {
     [600, function() {
       var status = {}
       try { status = JSON.parse(ipc.answer) } catch (error) {}
-      equal("status over IPC", status.ready === true && status.counting === true, true)
+      equal("status over IPC", status.counting === true && status.dataDir === dataDir, true)
+      equal("status lists what the user ignores", (status.ignoreApps || []).join(","),
+        "Secret,other,chrome-private.example.com__-Default")
+      // The folder is gone: this flush writes nothing and has it made again.
+      service.flush()
+      equal("nothing is written into a folder that is gone", readDay(), null)
     }],
-    [100, function() {
+    [400, function() {
       service.flush()
       var day = readDay()
       equal("only gamma after reset", day ? Object.keys(day.apps_ms).join(",") : null, "gamma")
-      // 500 + 300 + 600 + 100 ms have passed since the discard.
-      near("gamma ms after reset", day ? day.apps_ms.gamma : null, 1500)
-      near("active ms after reset", day ? day.active_ms : null, 1500)
+      // 500 + 300 + 600 + 400 ms have passed since the discard.
+      near("gamma ms after reset", day ? day.apps_ms.gamma : null, 1800)
+      near("active ms after reset", day ? day.active_ms : null, 1800)
     }],
-    // Files removed by hand, without discard: the next flush writes only
-    // what was not on disk yet, never the day it remembers.
+    // The folder removed by hand, without discard: the next flushes write
+    // only what was not on disk yet, never the day the service remembers.
     [200, function() { wipe.running = true }],
-    [800, function() {
+    [800, function() { service.flush() }],
+    [300, function() {
       service.flush()
       var day = readDay()
-      near("active ms after files vanished", day ? day.active_ms : null, 1000)
-      near("todayMs follows the disk", service.todayMs, 1000)
-      var status = JSON.parse(service.statusJson())
-      equal("status counting", status.counting, true)
-      equal("status dataDir", status.dataDir, dataDir)
+      near("active ms after the folder vanished", day ? day.active_ms : null, 1300)
+      near("todayMs follows the disk", service.todayMs, 1300)
     }],
     // One more second that nobody flushes: the shell closing must write it.
     // tests/harness.sh reads the file once this process is gone.
@@ -166,7 +181,8 @@ ShellRoot {
 
   Process {
     id: wipe
-    command: ["rm", "-rf", harness.dataDir + "/days"]
+    // The whole folder, as `omawrapped reset` and the README's removal do.
+    command: ["rm", "-rf", harness.dataDir]
   }
 
   // Calls the service the way `omarchy-shell <plugin id> <method>` does.

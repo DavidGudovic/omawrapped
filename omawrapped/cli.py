@@ -34,12 +34,28 @@ def _shell(method: str):
     return done.stdout.strip() if done.returncode == 0 else None
 
 
+def _sampler():
+    """(status, ours): the running sampler's status, or None, and whether it records to the folder this command reads.
+
+    A shell may be running with its data elsewhere while this command is
+    tried out on a copy (XDG_DATA_HOME). That sampler is not ours to flush,
+    and least of all to tell to forget.
+    """
+    try:
+        status = json.loads(_shell("status") or "")
+    except ValueError:
+        status = None
+    if not isinstance(status, dict):
+        return None, False
+    return status, status.get("dataDir") == str(store.data_dir())
+
+
 def _period(args) -> aggregate.Period:
     return aggregate.last_days(args.days, date.today())
 
 
 def _repo_dirs(args) -> list:
-    if args.repos:
+    if getattr(args, "repos", None):
         return [d for value in args.repos for d in system.split_list(value)]
     return system.split_list(system.settings().get("repoDirs")) or list(gitstats.DEFAULT_DIRS)
 
@@ -47,10 +63,15 @@ def _repo_dirs(args) -> list:
 def _collect(args):
     """(summary, git stats) for the period the arguments name."""
     # The sampler holds up to a minute in memory; ask it to write that first.
-    _shell("flush")
+    if _sampler()[1]:
+        _shell("flush")
     period = _period(args)
     names = system.AppNames()
-    summary = aggregate.summarize(store.load_days(period.start, period.end), period, names.name, args.exclude or ())
+    # An app the user has told the sampler to ignore stays off the card for
+    # the days recorded before that, too.
+    hidden = list(args.exclude or ()) + system.split_list(system.settings().get("ignoreApps"))
+    summary = aggregate.summarize(store.load_days(period.start, period.end), period, names.name,
+                                  [system.app_key(app) for app in hidden])
     start = datetime.combine(period.start, time.min).astimezone()
     end = datetime.combine(period.end + timedelta(days=1), time.min).astimezone()
     return summary, gitstats.count_commits(_repo_dirs(args), start, end)
@@ -165,6 +186,7 @@ def _stats_json(summary, git) -> dict:
         "commits": git.commits if git.scanned else None,
         "repos_with_commits": git.repos,
         "repos_scanned": git.scanned,
+        "commits_incomplete": git.incomplete,
     }
 
 
@@ -186,7 +208,9 @@ def cmd_stats(args) -> int:
         ("Busiest day", "%s · %s" % (busiest[0].strftime("%a %b ") + str(busiest[0].day), aggregate.duration(busiest[1]))),
         ("Busiest hour", aggregate.hour_label(summary.peak_hour) if summary.peak_hour is not None else "unknown"),
         ("App switches", format(summary.switches, ",")),
-        ("Commits", "%s in %d of %d repos" % (format(git.commits, ","), git.repos, git.scanned)
+        ("Commits", "%s in %d of %d repos%s" % (
+            format(git.commits, ","), git.repos, git.scanned,
+            " (at least: not every repository could be read)" if git.incomplete else "")
             if git.scanned else "no repositories found in " + ", ".join(_repo_dirs(args))),
     ]
     for label, value in rows:
@@ -218,17 +242,22 @@ def cmd_status(args) -> int:
             files[0][0].isoformat(), files[-1][0].isoformat(), size / 1024))
     else:
         print("Data      %s: nothing recorded yet" % store.data_dir())
-    try:
-        sampler = json.loads(_shell("status") or "")
-    except ValueError:
-        sampler = None
-    if isinstance(sampler, dict):
+    sampler, ours = _sampler()
+    if sampler is None:
+        print("Sampler   not running. It runs while the widget is enabled: omarchy plugin enable %s" % PLUGIN_ID)
+        ignored = system.split_list(system.settings().get("ignoreApps"))
+    elif not ours:
+        print("Sampler   running, but recording to %s, not the folder above" % sampler.get("dataDir"))
+        ignored = system.split_list(sampler.get("ignoreApps"))
+    else:
         state = "counting" if sampler.get("counting") else (
             "paused (session locked)" if sampler.get("locked") else "paused (away)")
-        print("Sampler   running, %s; away after %ss without input; today %s" % (
-            state, sampler.get("idleSeconds"), aggregate.duration(sampler.get("todayMs") or 0)))
-    else:
-        print("Sampler   not running. It runs while the widget is enabled: omarchy plugin enable %s" % PLUGIN_ID)
+        print("Sampler   running, %s; away after %ss without input%s; today %s" % (
+            state, sampler.get("idleSeconds"),
+            "" if sampler.get("countKeptAwake", True) else " (a video or call does not count)",
+            aggregate.duration(sampler.get("todayMs") or 0)))
+        ignored = system.split_list(sampler.get("ignoreApps"))
+    print("Ignored   %s" % (", ".join(ignored) if ignored else "no apps"))
     metrics = render.Metrics(system.monospace_family())
     print("Renderer  rsvg-convert %s; text measured with %s; font %s" % (
         "found" if render.have_renderer() else "MISSING (package librsvg)",
@@ -258,7 +287,8 @@ def cmd_reset(args) -> int:
     # The sampler still holds the last minute and would write it back as a
     # new file. It forgets first: whatever it writes before the files go is
     # then deleted with them.
-    _shell("discard")
+    if _sampler()[1] and _shell("discard") != "ok":
+        _say("The sampler did not answer, so it may still write its last minute. Run reset again in a moment.")
     removed = store.reset()
     print("Deleted %d day file%s. Cards already saved to your Pictures folder were left alone." % (
         removed, "" if removed == 1 else "s"))
@@ -267,10 +297,13 @@ def cmd_reset(args) -> int:
 
 # ---- arguments ----
 
-def _positive(text: str) -> int:
-    value = int(text)
+def _days(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
     if not 1 <= value <= 366:
-        raise argparse.ArgumentTypeError("must be between 1 and 366")
+        raise argparse.ArgumentTypeError("must be a whole number from 1 to 366")
     return value
 
 
@@ -280,7 +313,7 @@ def _add_period(parser) -> None:
                        help="the last 7 days, today included (default)")
     group.add_argument("--month", dest="days", action="store_const", const=aggregate.PERIODS["month"],
                        help="the last 30 days, today included")
-    group.add_argument("--days", dest="days", type=_positive, metavar="N", help="the last N days, today included")
+    group.add_argument("--days", dest="days", type=_days, metavar="N", help="the last N days, today included")
     parser.set_defaults(days=aggregate.PERIODS["week"])
     parser.add_argument("--exclude", action="append", metavar="APP",
                         help="leave an app out of the app list (name or window class; repeatable)")
@@ -317,7 +350,6 @@ def parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser("status", help="show what is stored, whether the sampler runs, and what is installed",
                                  description="Show what is stored, whether the sampler runs, and what is installed.")
-    status.add_argument("--repos", action="append", metavar="DIR", help=argparse.SUPPRESS)
     status.set_defaults(run=cmd_status)
 
     reset = commands.add_parser("reset", help="delete everything OmaWrapped has recorded",

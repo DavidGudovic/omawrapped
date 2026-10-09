@@ -1,6 +1,7 @@
 import support  # noqa: F401  (must stay first: it disables bytecode and isolates the environment)
 
 import os
+import subprocess
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -205,6 +206,47 @@ class CountCommitsTests(IsolatedCase):
         repo = init_repo(self.root / "a")
         commit(repo, NOON, committed=START - gitstats.LOOKBACK - timedelta(days=1))
         self.assertEqual(self.count().commits, 0)
+
+    def test_git_is_run_in_each_repository_whatever_the_environment_points_at(self):
+        # GIT_DIR beats `git -C`: left in place, every repository would be read as this one.
+        decoy = init_repo(self.tmp / "decoy")
+        for _ in range(5):
+            commit(decoy, NOON)
+        repo = init_repo(self.root / "a")
+        commit(repo, NOON)
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(decoy / ".git"), "GIT_WORK_TREE": str(decoy)}):
+            stats = self.count()
+        self.assertEqual((stats.commits, stats.repos, stats.scanned), (1, 1, 1))
+
+    def test_a_complete_count_says_so(self):
+        commit(init_repo(self.root / "a"), NOON)
+        self.assertFalse(self.count().incomplete)
+        self.assertFalse(count_commits([self.tmp / "nowhere"], START, END).incomplete)
+
+    def test_a_search_cut_short_makes_the_count_a_lower_bound(self):
+        for name in "abc":
+            commit(init_repo(self.root / name), NOON)
+        with mock.patch.object(gitstats, "MAX_REPOS", 2):
+            stats = self.count()
+        self.assertEqual(stats.scanned, 2)
+        self.assertTrue(stats.incomplete)
+        with mock.patch.object(gitstats, "MAX_FOLDERS", 2):
+            self.assertTrue(self.count().incomplete)
+
+    def test_a_repository_that_does_not_answer_in_time_makes_the_count_a_lower_bound(self):
+        commit(init_repo(self.root / "a"), NOON)
+        commit(init_repo(self.root / "b"), NOON)
+        real = subprocess.run
+
+        def slow_in_b(command, **options):
+            if str(self.root / "b") in command:
+                raise subprocess.TimeoutExpired(command, options.get("timeout"))
+            return real(command, **options)
+
+        with mock.patch.object(gitstats.subprocess, "run", slow_in_b):
+            stats = self.count()
+        self.assertEqual((stats.commits, stats.repos, stats.scanned), (1, 1, 2))
+        self.assertTrue(stats.incomplete)
 
     def test_merge_commits_are_not_counted(self):
         repo = init_repo(self.root / "a")

@@ -40,6 +40,13 @@ class CliCase(IsolatedCase):
         self.work.mkdir()
         self.addCleanup(self.assert_no_bytecode)
 
+    def sampler(self, **fields) -> None:
+        """A running sampler, as the shell stand-in reports it. By default it records to this test's data folder."""
+        status = {"counting": True, "locked": False, "idleSeconds": 120, "countKeptAwake": True, "ignoreApps": [],
+                  "todayMs": 0, "dataDir": str(self.data_home / "omawrapped")}
+        status.update(fields)
+        self.stubs.reply_to_status(json.dumps(status))
+
     def assert_no_bytecode(self):
         self.assertEqual(bytecode_dirs(), [], "the launcher must not leave bytecode in the plugin folder")
 
@@ -147,9 +154,35 @@ class StatsTests(CliCase):
         self.assertEqual(stats["apps"], [])
         self.assertEqual(len(stats["days"]), 7)
 
-    def test_the_shell_is_asked_to_flush_first(self):
+    def test_the_sampler_is_asked_to_flush_first(self):
+        self.sampler()
         self.ok("stats")
-        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " flush"])
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " status", PLUGIN_ID + " flush"])
+
+    def test_without_a_sampler_nothing_is_flushed(self):
+        self.ok("stats")
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " status"])
+
+    def test_a_sampler_that_records_elsewhere_is_left_alone(self):
+        # The command tried out on a copy of the data must not reach into the real sampler.
+        self.record()
+        self.sampler(dataDir="/somewhere/else/omawrapped")
+        self.ok("stats")
+        self.ok("card", "-o", self.tmp / "c.svg", "--copy", "none", "--days", "1")
+        self.ok("reset", "--yes")
+        self.assertEqual(set(self.stubs.calls("omarchy-shell")), {PLUGIN_ID + " status"})
+
+    def test_ignored_apps_stay_off_the_list_for_earlier_days_too(self):
+        self.record()
+        everything = self.stats()
+        self.write(self.config / "omarchy" / "shell.json", json.dumps({"version": 1, "bar": {"layout": {"right": [
+            {"id": PLUGIN_ID, "ignoreApps": "SLACK, chrome-web.whatsapp.com__-Default"}]}}}))
+        self.write_day(self.today, active_ms=7200000, apps_ms={"slack": 3600000, "web:web.whatsapp.com": 3600000})
+        names = [app["name"] for app in self.stats()["apps"]]
+        self.assertNotIn("Slack", names)
+        self.assertNotIn("web.whatsapp.com", names)
+        self.assertIn("Ghostty", names)
+        self.assertGreater(len(everything["apps"]), len(names) - 1)
 
     def test_json_totals_and_days_for_a_week(self):
         self.record()
@@ -370,7 +403,8 @@ class ArgumentErrorTests(CliCase):
                     self.assert_argument_error(command, "--days", value)
 
     def test_the_range_error_says_what_is_allowed(self):
-        self.assert_argument_error("stats", "--days", "0", message="between 1 and 366")
+        self.assert_argument_error("stats", "--days", "0", message="a whole number from 1 to 366")
+        self.assert_argument_error("stats", "--days", "abc", message="a whole number from 1 to 366")
 
     def test_week_and_month_together(self):
         for command in ("stats", "card"):
@@ -401,10 +435,11 @@ class CardTests(CliCase):
         self.assertEqual(self.run_cli("card").returncode, 1)
         self.assertFalse(self.pictures.exists())
 
-    def test_the_shell_is_asked_to_flush_first(self):
+    def test_the_sampler_is_asked_to_flush_first(self):
         self.record()
+        self.sampler()
         self.ok("card", "-o", self.tmp / "c.svg", "--copy", "none")
-        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " flush"])
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " status", PLUGIN_ID + " flush"])
 
     def test_svg_output_prints_exactly_its_absolute_path(self):
         self.record()
@@ -652,11 +687,28 @@ class StatusTests(CliCase):
              "running, counting; away after 90s without input; today 1h 00m"),
             ({"counting": False, "locked": True, "idleSeconds": 60, "todayMs": 0}, "running, paused (session locked)"),
             ({"counting": False, "locked": False, "idleSeconds": 60, "todayMs": 120000}, "running, paused (away)"),
+            ({"countKeptAwake": False, "idleSeconds": 60},
+             "running, counting; away after 60s without input (a video or call does not count); today 0m"),
         ]
         for reply, expected in cases:
             with self.subTest(reply=reply):
-                self.stubs.reply_to_status(json.dumps(reply))
+                self.sampler(**reply)
                 self.assertIn("Sampler   " + expected, self.ok("status").stdout)
+
+    def test_a_sampler_recording_elsewhere_is_named_as_such(self):
+        self.sampler(dataDir="/somewhere/else/omawrapped")
+        self.assertIn("Sampler   running, but recording to /somewhere/else/omawrapped, not the folder above",
+                      self.ok("status").stdout)
+
+    def test_says_what_is_ignored(self):
+        self.assertIn("Ignored   no apps", self.ok("status").stdout)
+        self.sampler(ignoreApps=["steam", "org.keepassxc.KeePassXC"])
+        self.assertIn("Ignored   steam, org.keepassxc.KeePassXC", self.ok("status").stdout)
+
+    def test_without_a_sampler_what_is_ignored_comes_from_the_settings(self):
+        self.write(self.config / "omarchy" / "shell.json", json.dumps({"version": 1, "bar": {"layout": {"center": [
+            {"id": PLUGIN_ID, "ignoreApps": "steam, signal"}]}}}))
+        self.assertIn("Ignored   steam, signal", self.ok("status").stdout)
 
     def test_garbage_from_the_shell_means_not_running(self):
         self.stubs.reply_to_status("this is not json")
@@ -670,10 +722,12 @@ class StatusTests(CliCase):
     def test_counts_repositories(self):
         repos = self.tmp / "repos"
         self.repo_with_commits(repos)
-        self.assertRegex(self.ok("status", "--repos", repos).stdout,
-                         r"(?m)^Git\s.*\b1 repository under " + re.escape(str(repos)))
+        # The folders come from the widget's setting, the way a user sets them.
+        self.write(self.config / "omarchy" / "shell.json", json.dumps({"version": 1, "bar": {"layout": {"right": [
+            {"id": PLUGIN_ID, "repoDirs": str(repos)}]}}}))
+        self.assertRegex(self.ok("status").stdout, r"(?m)^Git\s.*\b1 repository under " + re.escape(str(repos)))
         init_repo(repos / "second")
-        self.assertRegex(self.ok("status", "--repos", repos).stdout, r"(?m)^Git\s.*\b2 repositories under ")
+        self.assertRegex(self.ok("status").stdout, r"(?m)^Git\s.*\b2 repositories under ")
 
     def test_says_whether_git_is_there(self):
         self.assertRegex(self.ok("status").stdout, r"(?m)^Git\s+found")
@@ -715,9 +769,23 @@ class ResetTests(CliCase):
         self.assertEqual(self.card.read_text(encoding="utf-8"), "a card I made")
         self.assertEqual(os.listdir(self.pictures), [self.card.name])
 
-    def test_yes_asks_the_shell_to_discard_what_it_holds(self):
-        self.ok("reset", "--yes")
-        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " discard"])
+    def test_yes_asks_the_sampler_to_discard_what_it_holds(self):
+        self.sampler()
+        result = self.ok("reset", "--yes")
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " status", PLUGIN_ID + " discard"])
+        self.assertEqual(result.stderr, "")
+
+    def test_without_a_sampler_there_is_nothing_to_discard(self):
+        result = self.ok("reset", "--yes")
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [PLUGIN_ID + " status"])
+        self.assertEqual(result.stderr, "")
+
+    def test_a_sampler_that_does_not_answer_is_reported(self):
+        self.sampler()
+        self.stubs.stop_answering()
+        result = self.ok("reset", "--yes")
+        self.assertIn("The sampler did not answer", result.stderr)
+        self.assertIn("Deleted 12 day files.", result.stdout)
 
     def test_the_short_flag(self):
         self.assertIn("Deleted 12 day files.", self.ok("reset", "-y").stdout)
@@ -809,6 +877,7 @@ class IsolationTests(CliCase):
 
     def test_every_command_only_ever_reached_the_stand_ins(self):
         self.record()
+        self.sampler()
         repos = self.tmp / "repos"
         self.repo_with_commits(repos)
         self.ok("stats")
@@ -816,8 +885,8 @@ class IsolationTests(CliCase):
         self.ok("card", "-o", self.tmp / "c.svg", "--open", "--repos", repos)
         self.stubs.wait_for_call("xdg-open")
         self.ok("reset", "--yes")
-        self.assertEqual(self.stubs.calls("omarchy-shell"), [
-            PLUGIN_ID + " flush", PLUGIN_ID + " status", PLUGIN_ID + " flush", PLUGIN_ID + " discard"])
+        status, flush, discard = (PLUGIN_ID + " " + method for method in ("status", "flush", "discard"))
+        self.assertEqual(self.stubs.calls("omarchy-shell"), [status, flush, status, status, flush, status, discard])
         self.assertEqual(self.stubs.calls("wl-copy"), ["-- " + str(self.tmp / "c.svg")])
         self.assertEqual(self.stubs.calls("xdg-open"), [str(self.tmp / "c.svg")])
 

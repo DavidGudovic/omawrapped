@@ -102,7 +102,8 @@ describe("environment", () => {
     for (const name of ["VERSION", "MAX_APPS_PER_DAY", "MAX_APP_LENGTH", "SWITCH_DWELL_MS"]) {
       assert.equal(typeof tracker[name], "number", name)
     }
-    for (const name of ["emptyDay", "dateKey", "nextHourStart", "cleanApp", "addInterval", "create", "observe",
+    for (const name of ["emptyDay", "dateKey", "nextHourStart", "cleanApp", "appKey", "ignoreKey", "readStored",
+      "addInterval", "create", "observe",
       "takePending", "restorePending", "pendingDay", "parseDay", "mergeDay", "serialize", "formatDuration",
       "parseList", "entryFor", "anyLocked"]) {
       assert.equal(typeof tracker[name], "function", name)
@@ -532,6 +533,76 @@ describe("observe", () => {
     assert.equal(tracker.cleanApp(""), "")
     assert.equal(tracker.cleanApp("   "), "")
     assert.equal(tracker.cleanApp("__proto__x"), "__proto__x")
+  })
+})
+
+describe("appKey and ignoreKey", () => {
+  test("a browser's app window is counted under its site alone", () => {
+    assert.equal(tracker.appKey("chrome-web.whatsapp.com__-Default"), "web:web.whatsapp.com")
+    assert.equal(tracker.appKey("chrome-discord.com__channels_@me-Default"), "web:discord.com")
+    assert.equal(tracker.appKey("brave-music.youtube.com__watch-Profile_1"), "web:music.youtube.com")
+    // a host with hyphens, and in capitals
+    assert.equal(tracker.appKey("chrome-my-team.Example.NET__-Default"), "web:my-team.example.net")
+  })
+
+  test("the path and the profile never reach the key", () => {
+    const key = tracker.appKey("chrome-docs.example.com__document_d_1AbCdEf_edit-Private_Profile")
+    assert.equal(key, "web:docs.example.com")
+    assert.doesNotMatch(key, /document|1AbCdEf|edit|Private|Profile/)
+  })
+
+  test("other app ids are kept as they are, cleaned", () => {
+    for (const id of ["chromium", "com.mitchellh.ghostty", "org.gnome.Nautilus", "steam_app_12345",
+      "Google-chrome", "foo-bar__baz-qux", "chrome-localhost__-Default", "web:x.com"]) {
+      assert.equal(tracker.appKey(id), id, id)
+    }
+    assert.equal(tracker.appKey("  slack \n"), "slack")
+    assert.equal(tracker.appKey("__proto__"), "")
+    assert.equal(tracker.appKey(null), "")
+  })
+
+  test("observe counts a web app under its key, whatever page it is on", () => {
+    const state = run([
+      [0, "chrome-mail.example.com__inbox-Default"],
+      [10 * SEC, "chrome-mail.example.com__settings_filters-Default"],
+      [20 * SEC, "kitty"],
+      [30 * SEC, "kitty"],
+    ])
+    const day = pending(state)
+    assert.deepEqual(plain(day.apps_ms), { "web:mail.example.com": 20 * SEC, kitty: 10 * SEC })
+    assert.equal(day.switches, 1, "two pages of one web app are one app")
+  })
+
+  test("ignoreKey matches a class in any case and a web app by its site", () => {
+    assert.equal(tracker.ignoreKey("Steam"), tracker.ignoreKey("steam"))
+    assert.equal(tracker.ignoreKey("org.KeePassXC.KeePassXC"), "org.keepassxc.keepassxc")
+    assert.equal(tracker.ignoreKey("chrome-bank.example.com__-Default"),
+      tracker.ignoreKey("chrome-bank.example.com__accounts_overview-Default"))
+    assert.equal(tracker.ignoreKey("web:bank.example.com"), tracker.ignoreKey("chrome-BANK.example.com__-Default"))
+    assert.notEqual(tracker.ignoreKey("chrome-bank.example.com__-Default"), tracker.ignoreKey("chromium"))
+  })
+})
+
+describe("readStored", () => {
+  test("no text means no day yet, and the file may be written", () => {
+    for (const text of ["", "  ", "\n"]) {
+      assert.deepEqual(plain(tracker.readStored(text, DATE)), { ok: true, day: null }, JSON.stringify(text))
+    }
+  })
+
+  test("a day of ours is handed back to merge into", () => {
+    const stored = makeDay(DATE, { active: 5 * MIN, hours: { 10: 5 * MIN }, apps: { a: 5 * MIN }, switches: 1 })
+    const read = tracker.readStored(tracker.serialize(stored), DATE)
+    assert.equal(read.ok, true)
+    assert.deepEqual(plain(read.day), plain(stored))
+  })
+
+  test("anything else is left alone", () => {
+    const later = dayText({ version: 2 })
+    const other = dayText({ date: "2026-05-13" })
+    for (const text of ["{not json", "[]", "null", "\"text\"", later, other]) {
+      assert.equal(tracker.readStored(text, DATE).ok, false, text)
+    }
   })
 })
 

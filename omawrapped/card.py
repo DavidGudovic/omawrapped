@@ -30,7 +30,7 @@ class Facts:
     theme_name: str = ""
     plugins: int = 0
     omarchy: str = ""
-    # None when no repository was found to count in.
+    # None leaves the commit tile out.
     commits: int = None
     repos: int = 0
 

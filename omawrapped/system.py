@@ -11,8 +11,8 @@ from pathlib import Path
 
 from . import PLUGIN_ID
 
-HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
-# A Chromium app window: chrome-<host>__<path>-<Profile>.
+HEX = re.compile(r"#[0-9a-fA-F]{6}")
+# A browser's app window: chrome-<host>__<path>-<Profile>.
 WEBAPP_CLASS = re.compile(r"^[a-z]+-(?P<host>[^_/]+)__.*-[^-]+$")
 
 
@@ -49,7 +49,7 @@ def theme(directory=None) -> Theme:
         def pick(*keys):
             for key in keys:
                 value = colors.get(key)
-                if isinstance(value, str) and HEX.match(value):
+                if isinstance(value, str) and HEX.fullmatch(value):
                     return value.lower()
             return None
 
@@ -148,6 +148,17 @@ def monospace_family() -> str:
     return family if re.fullmatch(r"[\w .+-]{1,80}", family) else "monospace"
 
 
+def app_key(app: str) -> str:
+    """What the sampler counts an app under (appKey in Tracker.js).
+
+    A browser's app window is counted by its site alone, as web:<host>.
+    Anything else is its own key, so a name passes through unchanged.
+    """
+    app = app.strip()
+    web = WEBAPP_CLASS.match(app)
+    return "web:" + web.group("host").lower() if web and "." in web.group("host") else app
+
+
 class AppNames:
     """App ids (window classes) to the names people know the apps by.
 
@@ -200,9 +211,9 @@ class AppNames:
         known = self._by_id.get(app.casefold())
         if known:
             return known
-        web = WEBAPP_CLASS.match(app)
-        if web and "." in web.group("host"):
-            host = _bare_host(web.group("host"))
+        key = app_key(app)
+        if key.startswith("web:"):
+            host = _bare_host(key[4:])
             return self._by_host.get(host, host)
         # Reverse-DNS ids end in the app's name; plain ids are the name.
         last = app.rsplit(".", 1)[-1] if re.fullmatch(r"[\w-]+(\.[\w-]+){2,}", app) else app

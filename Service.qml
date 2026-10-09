@@ -11,7 +11,8 @@ import "Tracker.js" as Tracker
 // time in memory for at most a minute, and then adds it to one small file
 // per day under ~/.local/share/omawrapped/days/.
 //
-// Apart from creating its data folder once at start, it runs no program.
+// Apart from creating its data folder, at start and again if that folder
+// is ever deleted, it runs no program.
 // It opens no window, sends no notification and makes no network request.
 // Only the focused window's app id is read; its title is never looked at.
 //
@@ -38,7 +39,10 @@ Item {
   // screen time, unless the user says otherwise.
   readonly property bool countKeptAwake: entry.countKeptAwake !== false && entry.countKeptAwake !== "false"
   // The screensaver is a window like any other, and nobody is watching it.
-  readonly property var ignoredApps: ["org.omarchy.screensaver"].concat(Tracker.parseList(entry.ignoreApps))
+  // The list is matched by key, so a class may be typed in any case and a
+  // web app is matched by its site, whatever page it is on.
+  readonly property var ignoredKeys: ["org.omarchy.screensaver"].concat(Tracker.parseList(entry.ignoreApps))
+    .map(function(app) { return Tracker.ignoreKey(app) })
 
   // ---- What the session says right now ----
   //
@@ -64,7 +68,9 @@ Item {
   // ---- Internals ----
 
   readonly property int tickMs: 15000
-  readonly property int flushMs: 60000
+  // A flush every fourth tick. The margin is for a tick that comes a few
+  // milliseconds early, which would otherwise put the flush off by a tick.
+  readonly property int flushMs: 50000
   // A stretch longer than this means the tick did not run: suspend.
   readonly property int maxGapMs: tickMs * 3
 
@@ -102,15 +108,26 @@ Item {
     return dataDir + "/days/" + date + ".json"
   }
 
-  // { ok, day }: day is null for a file that is missing or not ours; ok is
-  // false only when the file is there and could not be read.
+  // { ok, day }: day is null when there is no file yet. ok is false when
+  // the file could not be read, or holds something that is not a day of
+  // ours: it is then left alone, and the time stays in memory.
   function readDay(date) {
     var view = fileComponent.createObject(root, { path: dayPath(date) })
     var text = view.text()
     var outcome = view.outcome
     view.destroy()
-    if (outcome === "loaded") return { ok: true, day: Tracker.parseDay(text, date) }
+    if (outcome === "loaded") return Tracker.readStored(text, date)
     return { ok: outcome === "missing", day: null }
+  }
+
+  // Asking for a folder as if it were a file fails either way, but only a
+  // missing one fails as "not found".
+  function folderExists() {
+    var view = fileComponent.createObject(root, { path: dataDir })
+    view.text()
+    var missing = view.outcome === "missing"
+    view.destroy()
+    return !missing
   }
 
   function writeDay(day) {
@@ -122,7 +139,7 @@ Item {
   }
 
   function isAway() {
-    return userIdle || sessionLocked || ignoredApps.indexOf(focusedApp) !== -1
+    return userIdle || sessionLocked || ignoredKeys.indexOf(Tracker.ignoreKey(focusedApp)) !== -1
   }
 
   // Closes the running stretch under the conditions it ran with and starts
@@ -146,6 +163,16 @@ Item {
     if (!_ready) return
     observe()
     _lastFlush = Date.now()
+    // The folder may be gone, deleted by `omawrapped reset` or by hand. A
+    // write would make it again, but open to other users; `prepare` makes
+    // it private, and what was counted waits in memory until it has.
+    if (!folderExists()) {
+      _ready = false
+      _stored = null
+      refreshToday()
+      prepare.running = true
+      return
+    }
     var today = Tracker.dateKey(_lastFlush)
     var pending = Tracker.takePending(_state)
     var todayRead = false
@@ -186,12 +213,11 @@ Item {
 
   function statusJson() {
     return JSON.stringify({
-      ready: _ready,
       counting: _ready && !away,
-      idle: userIdle,
       locked: sessionLocked,
       idleSeconds: idleSeconds,
       countKeptAwake: countKeptAwake,
+      ignoreApps: Tracker.parseList(entry.ignoreApps),
       todayMs: Math.round(todayMs),
       dataDir: dataDir
     })
@@ -208,9 +234,17 @@ Item {
   onFocusedAppChanged: sessionChanged()
   onUserIdleChanged: sessionChanged()
   onSessionLockedChanged: observe()
-  onIgnoredAppsChanged: observe()
+  onIgnoredKeysChanged: observe()
+  // Walking away is the moment before the screen locks, the machine sleeps
+  // or the session ends: what was counted goes to disk now, not at the
+  // next minute.
+  onAwayChanged: if (away) flush()
 
-  Component.onCompleted: prepare.running = true
+  Component.onCompleted: {
+    prepare.running = true
+    // What the shell last heard about the lock may be hours old.
+    if (pollLock) lockProbe.restart()
+  }
   Component.onDestruction: flush()
 
   IdleMonitor {
@@ -220,17 +254,17 @@ Item {
     respectInhibitors: root.countKeptAwake
   }
 
-  // The data directory is private to the user. This is the only program
-  // the service ever runs; the day files are written by the shell itself.
+  // The data folder is private to the user: made if it is missing, and
+  // closed to others if it was there but open. This is the only program the
+  // service ever runs; the day files are written by the shell itself.
   Process {
     id: prepare
-    command: ["mkdir", "-p", "-m", "700", root.dataDir]
+    command: ["sh", "-c", "mkdir -p \"$1\" && chmod 700 \"$1\"", "sh", root.dataDir]
     onExited: {
-      root._stored = root.readDay(Tracker.dateKey(Date.now())).day
-      root._lastFlush = Date.now()
       root._ready = true
-      root.observe()
-      root.refreshToday()
+      // Reads today's file, and writes whatever waited for the folder. If
+      // the folder could not be made, the next flush tries again.
+      if (root.folderExists()) root.flush()
     }
   }
 

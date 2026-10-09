@@ -53,6 +53,15 @@ function cleanApp(app) {
   return id === "__proto__" ? "" : id
 }
 
+// What an app is counted under. A browser's app window is named
+// chrome-<host>__<path>-<Profile>; only the host is kept, as web:<host>,
+// because the path can be a document's address and the profile a name.
+function appKey(app) {
+  var id = cleanApp(app)
+  var web = /^[a-z]+-([^_\/]+)__.*-[^-]+$/.exec(id)
+  return web && web[1].indexOf(".") !== -1 ? "web:" + web[1].toLowerCase() : id
+}
+
 function ownNumber(object, key) {
   var value = Object.prototype.hasOwnProperty.call(object, key) ? object[key] : 0
   return typeof value === "number" && isFinite(value) && value > 0 ? value : 0
@@ -120,7 +129,7 @@ function observe(state, nowMs, app, away, maxGapMs) {
     }
   }
   state.cursor = nowMs
-  state.app = cleanApp(app)
+  state.app = appKey(app)
   state.counting = !away
 }
 
@@ -178,6 +187,17 @@ function parseDay(text, date) {
   return day
 }
 
+// What the text of a day file allows the next flush to do:
+// { ok: true, day } to merge into it (day is null for an empty file), or
+// { ok: false } to leave it alone. A file that is not a day of this version
+// is somebody's data all the same: a later version's after a downgrade, or
+// one edited by hand. It is never overwritten.
+function readStored(text, date) {
+  if (String(text).trim() === "") return { ok: true, day: null }
+  var day = parseDay(text, date)
+  return { ok: day !== null, day: day }
+}
+
 // stored + delta as a new day. stored may be null (no file yet).
 function mergeDay(stored, delta) {
   var day = emptyDay(delta.date)
@@ -203,6 +223,13 @@ function formatDuration(ms) {
   var hours = Math.floor(minutes / 60)
   var rest = minutes % 60
   return hours > 0 ? hours + "h " + pad2(rest) + "m" : rest + "m"
+}
+
+// The key an app is matched under in an ignore list: the key it is counted
+// under, in lower case, so that the class `hyprctl clients` shows can be
+// typed in any case and a web app is matched by its site.
+function ignoreKey(app) {
+  return appKey(app).toLowerCase()
 }
 
 // "a, b ,c" -> ["a", "b", "c"]; anything else that is not a list -> [].
