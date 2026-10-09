@@ -35,7 +35,7 @@ env -i HOME="$RUN/home" XDG_RUNTIME_DIR="$RUN" XDG_DATA_HOME="$RUN/data" \
   XDG_CONFIG_HOME="$RUN/config" XDG_CACHE_HOME="$RUN/cache" XDG_STATE_HOME="$RUN/state" \
   PATH="$RUN/bin:/usr/bin" LANG=C.UTF-8 QT_QPA_PLATFORM=offscreen \
   QS_DISABLE_CRASH_HANDLER=1 QS_NO_RELOAD_POPUP=1 QS_DISABLE_FILE_WATCHER=1 \
-  OW_REPO="$REPO" OW_RUN="$RUN" \
+  OW_REPO="$REPO" OW_RUN="$RUN" OW_ROOT="$RUN/root" \
   /usr/bin/timeout -k 2 60 /usr/bin/quickshell -p "$RUN/root/shell.qml" > "$RUN/out.txt" 2>&1 || true
 
 grep -ao 'OW-CHECK .*' "$RUN/out.txt" || true

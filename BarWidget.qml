@@ -12,6 +12,7 @@ import "Tracker.js" as Tracker
 // click for the month.
 BarWidget {
   id: root
+  moduleName: "io.github.davidgudovic.omawrapped"
 
   // Null while the service is still loading and under a replacement bar.
   readonly property var service: (bar && bar.shell && typeof bar.shell.serviceFor === "function")

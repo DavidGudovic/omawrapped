@@ -104,18 +104,29 @@ ShellRoot {
       service.focusedApp = "gamma"
       service.userIdle = false
     }],
-    // `omawrapped reset` under a running shell: files go, then discard.
+    // `omawrapped reset` under a running shell: the files go, then the
+    // service is told to discard over IPC, as the command does. That it
+    // answers at all also shows the new service took the IPC target over
+    // from the one destroyed above.
     [1000, function() { wipe.running = true }],
-    [300, function() {
-      service.discard()
+    [300, function() { ipc.call("discard") }],
+    [700, function() {
+      equal("discard over IPC answered", ipc.answer, "ok")
       equal("todayMs after discard", service.todayMs, 0)
+      ipc.call("status")
     }],
-    [1000, function() {
+    [700, function() {
+      var status = {}
+      try { status = JSON.parse(ipc.answer) } catch (error) {}
+      equal("status over IPC", status.ready === true && status.counting === true, true)
+    }],
+    [100, function() {
       service.flush()
       var day = readDay()
       equal("only gamma after reset", day ? Object.keys(day.apps_ms).join(",") : null, "gamma")
-      near("gamma ms after reset", day ? day.apps_ms.gamma : null, 1000)
-      near("active ms after reset", day ? day.active_ms : null, 1000)
+      // 700 + 700 + 100 ms have passed since the discard.
+      near("gamma ms after reset", day ? day.apps_ms.gamma : null, 1500)
+      near("active ms after reset", day ? day.active_ms : null, 1500)
     }],
     // Files removed by hand, without discard: the next flush writes only
     // what was not on disk yet, never the day it remembers.
@@ -156,6 +167,19 @@ ShellRoot {
   Process {
     id: wipe
     command: ["rm", "-rf", harness.dataDir + "/days"]
+  }
+
+  // Calls the service the way `omarchy-shell <plugin id> <method>` does.
+  Process {
+    id: ipc
+    property string answer: ""
+    function call(method) {
+      answer = ""
+      command = ["quickshell", "ipc", "-p", Quickshell.env("OW_ROOT") + "/shell.qml", "call", "--",
+        "io.github.davidgudovic.omawrapped", method]
+      running = true
+    }
+    stdout: StdioCollector { onStreamFinished: ipc.answer = text.trim() }
   }
 
   Component {
