@@ -110,7 +110,7 @@ ShellRoot {
       view.destroy()
       equal("failure is notified once, under the app's name", sent.slice(0, 5).join("|"),
         "--app-name|OmaWrapped|-g|" + glyph + "|OmaWrapped could not make the card")
-      truthy("the notification says why: " + sent[5], /^Nothing was recorded for last 7 days \(.+\)\.$/.test(sent[5] || ""))
+      truthy("the notification says why: " + sent[5], /^Nothing was recorded for the last 7 days \(.+\)\.$/.test(sent[5] || ""))
       equal("nothing after the reason", sent.slice(6).join(""), "")
       widget.destroy()
     }]

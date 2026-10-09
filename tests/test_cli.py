@@ -244,6 +244,28 @@ class StatsTests(CliCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Screen time", result.stdout)
 
+    def test_under_a_minute_is_too_little_for_a_card(self):
+        # Times are shown in minutes, so a card of 59 seconds would say "0m" everywhere.
+        self.write_day(self.today, active_ms=59999, apps_ms={"slack": 59999})
+        result = self.run_cli("card", "-o", self.tmp / "c.svg", "--copy", "none")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Less than a minute was recorded for the last 7 days", result.stderr)
+        self.assertFalse((self.tmp / "c.svg").exists())
+        said = self.run_cli("stats")
+        self.assertEqual(said.returncode, 0, said.stderr)
+        self.assertIn("Less than a minute was recorded for the last 7 days", said.stdout)
+        self.assertEqual(self.stats()["screen_time_ms"], 59999)
+
+    def test_one_minute_is_enough_for_a_card(self):
+        self.write_day(self.today, active_ms=60000, apps_ms={"slack": 60000})
+        self.ok("card", "--days", "1", "-o", self.tmp / "c.svg", "--copy", "none")
+        self.assertIn("1m", svg_texts(self.tmp / "c.svg"))
+
+    def test_the_message_names_the_period(self):
+        self.assertIn("Nothing was recorded for today", self.run_cli("stats", "--days", "1").stdout)
+        self.assertIn("Nothing was recorded for the last 30 days", self.run_cli("stats", "--month").stdout)
+
     def test_time_without_an_hour_breakdown_still_makes_a_card(self):
         self.write_day(self.today, active_ms=3600000, hours_ms=[], apps_ms={"slack": 3600000}, switches=3)
         self.ok("card", "-o", self.tmp / "c.svg", "--copy", "none")

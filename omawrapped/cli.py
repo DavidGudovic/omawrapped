@@ -56,11 +56,20 @@ def _collect(args):
     return summary, gitstats.count_commits(_repo_dirs(args), start, end)
 
 
-def _nothing_recorded(period: aggregate.Period) -> str:
+# A card needs at least a minute to say anything: times are shown in minutes.
+ENOUGH_MS = 60000
+
+
+def _too_little(summary: aggregate.Summary) -> str:
+    """Why there is no card to draw, and what to do about it."""
+    period = summary.period
     return (
-        "Nothing was recorded for %s (%s).\n"
+        "%s was recorded for %s (%s).\n"
         "OmaWrapped counts while its widget is enabled in the bar: omarchy plugin enable %s\n"
-        "Data folder: %s" % (period.label.lower(), period.span, PLUGIN_ID, store.data_dir())
+        "Data folder: %s" % (
+            "Less than a minute" if summary.total_ms else "Nothing",
+            "today" if period.length == 1 else "the last %d days" % period.length,
+            period.span, PLUGIN_ID, store.data_dir())
     )
 
 
@@ -102,8 +111,8 @@ def _open(path: Path) -> None:
 
 def cmd_card(args) -> int:
     summary, git = _collect(args)
-    if summary.total_ms == 0:
-        _say(_nothing_recorded(summary.period))
+    if summary.total_ms < ENOUGH_MS:
+        _say(_too_little(summary))
         return 1
     theme = system.theme(args.theme)
     facts = card.Facts(
@@ -163,8 +172,8 @@ def cmd_stats(args) -> int:
         return 0
     period = summary.period
     print("OmaWrapped · %s · %s\n" % (period.label, period.span))
-    if summary.total_ms == 0:
-        print(_nothing_recorded(period))
+    if summary.total_ms < ENOUGH_MS:
+        print(_too_little(summary))
         return 0
     busiest = summary.busiest_day
     rows = [

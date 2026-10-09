@@ -28,7 +28,7 @@ The widget is all you need. To also run `omawrapped` from a terminal, link the c
 ln -s ~/.config/omarchy/plugins/io.github.davidgudovic.omawrapped/bin/omawrapped ~/.local/bin/omawrapped
 ```
 
-Counting starts when you enable the plugin; there is no history from before that. The bar starts at `0m`, and a card is worth making after a day or two.
+Counting starts when you enable the plugin; there is no history from before that. The bar starts at `0m`. A card can be drawn once a minute has been recorded, and is worth making after a day or two.
 
 ### What it needs
 
@@ -99,14 +99,14 @@ omarchy bar set io.github.davidgudovic.omawrapped countKeptAwake false
 | By day, busiest day | Screen time per calendar day. |
 | By hour, busiest hour | Screen time per hour of the day, added up over the period. |
 | App switches | How often you moved from one app to a different one and stayed at least a second. |
-| Commits | Commits you authored in the period, in repositories at most four folders below `repoDirs`. "You" is the e-mail each repository commits with. Merge commits are left out, and a commit on several branches or in several clones counts once. |
+| Commits | Commits you authored in the period, in repositories at most four folders below `repoDirs`. "You" is the e-mail each repository commits with. Merge commits are left out, and a commit on several branches or in several clones counts once. Shown when there is at least one. |
 | Theme, plugins, Omarchy version | Read from Omarchy's own files when the card is drawn. |
 
 Terminal commands are not counted. Bash keeps no time with its history by default, so a count for a period could not be trusted, and reading the history at all is more than a recap card should do.
 
 ## How it counts, and what that costs
 
-OmaWrapped does not poll, and it starts no background program. The counting is a small service inside the Omarchy shell (`Service.qml`), which already knows the three things that matter:
+OmaWrapped starts no background program. The counting is a small service inside the Omarchy shell (`Service.qml`), which already knows the three things that matter:
 
 - **Which app has focus.** The shell is told by the compositor when focus changes. OmaWrapped reads the app id of the focused window (its window class) and nothing else about it.
 - **Whether you are there.** The compositor reports when there has been no input for `idleSeconds`. A playing video or a call holds that off, the same way it keeps your screen from locking, so watching something counts. Switch `countKeptAwake` off if you would rather count input only.
@@ -122,7 +122,7 @@ A few rules keep the numbers honest:
 - An app switch counts once the new app has held focus for a second. Focus passes over windows all the time without anyone switching, for instance when a workspace changes or the screensaver starts.
 - When the shell is closed or reloads its plugins, the service writes what it has first. A crash or power cut loses at most the last minute.
 
-**Cost.** One timer tick every 15 seconds that does a few additions and one request on an open socket, plus one write of about a kilobyte per minute while you are at the screen. Measured with `tests/live.sh`, which hosts the service alone in a Quickshell of its own: 0.12 seconds of CPU over five and a half minutes, 0.09 of them spent starting Quickshell. That leaves about a hundredth of a percent of one core. The data is about 1 KB per day of use.
+**Cost.** One timer tick every 15 seconds that does a few additions and one request on an open socket, plus one write of about a kilobyte per minute while you are at the screen. Measured with `tests/live.sh`, which hosts the service alone in a Quickshell of its own: a 12-second run used 0.09 seconds of CPU, which is Quickshell starting, and a 330-second run used 0.12. The 0.03 seconds between them are five minutes of sampling, about a hundredth of a percent of one core. The data is about 1 KB per day of use.
 
 ## Privacy
 
@@ -145,7 +145,7 @@ An app is named by its window class, such as `chromium` or `com.mitchellh.ghostt
 
 **Keeping an app out.** Add its window class to `ignoreApps` and it is never recorded: time in it does not count at all. To keep an app off one card only, use `omawrapped card --exclude`.
 
-**Wiping it.** `omawrapped reset` deletes every recorded day and tells the running service to forget the minute it still holds. Deleting `~/.local/share/omawrapped` by hand does the same. Cards you already saved are ordinary pictures in your Pictures folder; delete them like any other.
+**Wiping it.** `omawrapped reset` deletes every recorded day and tells the running service to forget the minute it still holds. Deleting `~/.local/share/omawrapped` by hand works too; the service then writes only what it had not saved yet, at most a minute. Cards you already saved are ordinary pictures in your Pictures folder; delete them like any other.
 
 ## What it creates
 
@@ -184,10 +184,11 @@ To pause without removing anything, `omarchy plugin disable io.github.davidgudov
 ```bash
 tests/check.sh               # everything: accounting, command, manifest, service and widget, all headless
 tests/live.sh 300            # run the real sampler against your session for 5 minutes, without installing
+tests/live.sh 300 /tmp/ow    # the same, keeping what it recorded: XDG_DATA_HOME=/tmp/ow bin/omawrapped stats
 tests/make_sample.py /tmp/ow --repos && XDG_DATA_HOME=/tmp/ow/data bin/omawrapped card --repos /tmp/ow/repos -o /tmp/ow/card.png
 ```
 
-`Tracker.js` is the accounting, as pure functions. `Service.qml` connects it to the session and the disk. `BarWidget.qml` is the bar widget. `omawrapped/` is the command: `store` reads the day files, `aggregate` sums them, `gitstats` counts commits, `system` reads theme and names, `card` draws, `render` measures text and calls `rsvg-convert`. The tests need `node` and the system Python; none of them touches your session, clipboard or recorded data.
+`Tracker.js` is the accounting, as pure functions. `Service.qml` connects it to the session and the disk. `BarWidget.qml` is the bar widget. `omawrapped/` is the command: `store` reads the day files, `aggregate` sums them, `gitstats` counts commits, `system` reads theme and names, `card` draws, `render` measures text and calls `rsvg-convert`. `tests/check.sh` needs `node` and the system Python, and touches neither your session, your clipboard nor your recorded data. `tests/live.sh` only listens to your session, and records into a temporary folder.
 
 ## License
 

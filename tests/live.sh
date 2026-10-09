@@ -1,5 +1,5 @@
 #!/usr/bin/sh
-# tests/live.sh [seconds]
+# tests/live.sh [seconds] [data-home]
 # Runs the real sampler against your live session (default: 300 seconds)
 # without installing anything, and prints what it saw and what it recorded.
 #
@@ -7,10 +7,13 @@
 # focus is taken, no notification is sent. What it records goes to a
 # throwaway directory, never to ~/.local/share/omawrapped. Use the desktop
 # normally while it runs; leave it alone for half a minute to see it pause.
+#
+# Give a second argument to keep what was recorded, and draw a card from it:
+#   tests/live.sh 300 /tmp/ow && XDG_DATA_HOME=/tmp/ow bin/omawrapped card -o /tmp/ow/card.png
 set -eu
 
 SECONDS_TO_RUN=${1:-300}
-case "$SECONDS_TO_RUN" in ''|*[!0-9]*) echo "usage: live.sh [seconds]" >&2; exit 2 ;; esac
+case "$SECONDS_TO_RUN" in ''|*[!0-9]*) echo "usage: live.sh [seconds] [data-home]" >&2; exit 2 ;; esac
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 RUN=$(/usr/bin/mktemp -d "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is not set}/ow-live.XXXXXX")
@@ -19,7 +22,10 @@ trap 'rm -rf -- "$RUN"' EXIT
 mkdir "$RUN/root"
 cp -- "$REPO/tests/live/shell.qml" "$RUN/root/shell.qml"
 
-XDG_DATA_HOME="$RUN/data" OW_REPO="$REPO" OW_SECONDS="$SECONDS_TO_RUN" \
+DATA_HOME=${2:-$RUN/data}
+case "$DATA_HOME" in /*) ;; *) echo "live: the data home must be an absolute path" >&2; exit 2 ;; esac
+
+XDG_DATA_HOME="$DATA_HOME" OW_REPO="$REPO" OW_SECONDS="$SECONDS_TO_RUN" \
   QS_DISABLE_CRASH_HANDLER=1 QS_NO_RELOAD_POPUP=1 QS_DISABLE_FILE_WATCHER=1 \
   /usr/bin/quickshell -p "$RUN/root/shell.qml" > "$RUN/out.txt" 2>&1 &
 PID=$!
