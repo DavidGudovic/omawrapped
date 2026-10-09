@@ -114,7 +114,10 @@ def cmd_card(args) -> int:
     if summary.total_ms < ENOUGH_MS:
         _say(_too_little(summary))
         return 1
-    theme = system.theme(args.theme)
+    if args.theme and not (Path(args.theme).expanduser() / "colors.toml").is_file():
+        _say("%s is not a theme folder: it has no colors.toml." % args.theme)
+        return 1
+    theme = system.theme(Path(args.theme).expanduser() if args.theme else None)
     facts = card.Facts(
         theme_name=theme.name,
         plugins=system.plugin_count(),
@@ -252,10 +255,11 @@ def cmd_reset(args) -> int:
         if answer.strip().lower() not in ("y", "yes"):
             _say("Nothing was deleted.")
             return 1
-    removed = store.reset()
-    # The sampler still holds the last minute; without this it would write
-    # it back as a new file.
+    # The sampler still holds the last minute and would write it back as a
+    # new file. It forgets first: whatever it writes before the files go is
+    # then deleted with them.
     _shell("discard")
+    removed = store.reset()
     print("Deleted %d day file%s. Cards already saved to your Pictures folder were left alone." % (
         removed, "" if removed == 1 else "s"))
     return 0

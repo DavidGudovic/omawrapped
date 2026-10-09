@@ -460,6 +460,17 @@ class CardTests(CliCase):
         self.assertNotIn("Chromium", found)
         self.assertIn("Ghostty", found)
 
+    def test_a_theme_folder_without_colors_is_refused(self):
+        # A mistyped folder must not quietly give a card in the fallback colours.
+        self.record()
+        empty = self.tmp / "themes" / "no-such-theme"
+        empty.mkdir(parents=True)
+        for folder in (empty, self.tmp / "nowhere"):
+            result = self.run_cli("card", "--theme", folder, "-o", self.tmp / "c.svg", "--copy", "none")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("is not a theme folder", result.stderr)
+            self.assertFalse((self.tmp / "c.svg").exists())
+
     def test_the_footer_and_colors_come_from_the_system_and_the_theme_folder(self):
         self.record()
         theme = self.write(self.tmp / "themes" / "my-theme" / "colors.toml",

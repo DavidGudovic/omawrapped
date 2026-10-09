@@ -104,18 +104,18 @@ ShellRoot {
       service.focusedApp = "gamma"
       service.userIdle = false
     }],
-    // `omawrapped reset` under a running shell: the files go, then the
-    // service is told to discard over IPC, as the command does. That it
+    // `omawrapped reset` under a running shell: the service is told to
+    // discard over IPC, then the files go, as the command does. That it
     // answers at all also shows the new service took the IPC target over
     // from the one destroyed above.
-    [1000, function() { wipe.running = true }],
-    [300, function() { ipc.call("discard") }],
-    [700, function() {
+    [1000, function() { ipc.call("discard") }],
+    [500, function() {
       equal("discard over IPC answered", ipc.answer, "ok")
       equal("todayMs after discard", service.todayMs, 0)
-      ipc.call("status")
+      wipe.running = true
     }],
-    [700, function() {
+    [300, function() { ipc.call("status") }],
+    [600, function() {
       var status = {}
       try { status = JSON.parse(ipc.answer) } catch (error) {}
       equal("status over IPC", status.ready === true && status.counting === true, true)
@@ -124,7 +124,7 @@ ShellRoot {
       service.flush()
       var day = readDay()
       equal("only gamma after reset", day ? Object.keys(day.apps_ms).join(",") : null, "gamma")
-      // 700 + 700 + 100 ms have passed since the discard.
+      // 500 + 300 + 600 + 100 ms have passed since the discard.
       near("gamma ms after reset", day ? day.apps_ms.gamma : null, 1500)
       near("active ms after reset", day ? day.active_ms : null, 1500)
     }],

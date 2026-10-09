@@ -175,7 +175,7 @@ Item {
   }
 
   // Forgets what was not written yet. `omawrapped reset` calls this
-  // after deleting the files, so nothing recorded before it survives.
+  // before deleting the files, so nothing recorded before it survives.
   function discard() {
     // The running stretch is closed first, or it would be counted after.
     observe()
